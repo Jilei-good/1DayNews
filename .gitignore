@@ -2,6 +2,8 @@
 .env
 .env.*
 !env.example
+config.toml
+!config.example.toml
 
 # ===== runtime state (must not be shared) =====
 # Match at any depth so running from repo root OR src/ both stay clean.

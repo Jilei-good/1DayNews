@@ -22,9 +22,9 @@ import re
 import sys
 import json
 import time
+import html
 import hashlib
 import logging
-import platform
 import sqlite3
 import argparse
 from logging.handlers import RotatingFileHandler
@@ -34,69 +34,15 @@ from pathlib import Path
 import feedparser
 import requests
 
+try:
+    from config_utils import CONFIG_FILE, config_exists, data_dir_from_config, ensure_config_file, load_config
+except ModuleNotFoundError:
+    from .config_utils import CONFIG_FILE, config_exists, data_dir_from_config, ensure_config_file, load_config
+
 
 # ================== CONFIG ==================
-def _user_config_path() -> Path:
-    """XDG-compliant per-user config path. Cross-platform.
-
-    Linux / macOS: $XDG_CONFIG_HOME/vuln-monitor/config.json  (default ~/.config/...)
-    Windows:       %APPDATA%\\vuln-monitor\\config.json
-    """
-    if platform.system() == "Windows":
-        base = os.getenv("APPDATA") or str(Path.home())
-    else:
-        base = os.getenv("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "vuln-monitor" / "config.json"
-
-
-USER_CONFIG_FILE = _user_config_path()
-
-
-def _load_user_config() -> dict:
-    """Load persisted local config. Returns {} if missing or unreadable."""
-    if not USER_CONFIG_FILE.exists():
-        return {}
-    try:
-        return json.loads(USER_CONFIG_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"WARN: failed to parse {USER_CONFIG_FILE}: {e}", file=sys.stderr)
-        return {}
-
-
-# Resolution order for credentials:
-#   1. environment variable   (CI / systemd / one-off override)
-#   2. user config file       (persisted via `scripts/configure.py`)
-#   3. empty string           (TG_* empty -> dry mode, no push)
-_user_cfg = _load_user_config()
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or _user_cfg.get("tg_bot_token", "")
-_raw_chat_id = os.getenv("TG_CHAT_ID")   or _user_cfg.get("tg_chat_id", "")
-TG_CHAT_IDS  = [c.strip() for c in _raw_chat_id.split(",") if c.strip()]
-GH_TOKEN     = os.getenv("GH_TOKEN")     or _user_cfg.get("gh_token", "")
-NVD_API_KEY  = os.getenv("NVD_API_KEY") or _user_cfg.get("nvd_api_key", "")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY") or _user_cfg.get("deepseek_api_key", "")
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")   or _user_cfg.get("openai_api_key", "")
-LLM_MODEL    = os.getenv("LLM_MODEL")       or _user_cfg.get("llm_model", "")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL")   or _user_cfg.get("llm_base_url", "")
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE") or _user_cfg.get("llm_temperature", "0.1"))
-LLM_MAX_TOKENS  = int(os.getenv("LLM_MAX_TOKENS")    or _user_cfg.get("llm_max_tokens", "1024"))
-LLM_TIMEOUT     = int(os.getenv("LLM_TIMEOUT")        or _user_cfg.get("llm_timeout", "60"))
-LLM_MAX_CONTEXT = int(os.getenv("LLM_MAX_CONTEXT")    or _user_cfg.get("llm_max_context", "1048576"))
-LLM_REASONING   = os.getenv("LLM_REASONING_EFFORT")   or _user_cfg.get("llm_reasoning_effort", "high")
-LLM_TOP_P       = float(os.getenv("LLM_TOP_P")        or _user_cfg.get("llm_top_p", "0.9"))
-PROXY        = os.getenv("HTTPS_PROXY")  or _user_cfg.get("https_proxy", "")
-
-SCRIPT_DIR     = Path(__file__).resolve().parent
-# Runtime state (cache / lock / alert-state / log) lives in DATA_DIR.
-# Resolution order:
-#   1. $VULN_DATA_DIR env var (systemd / deploy.sh set this explicitly)
-#   2. SCRIPT_DIR.parent if SCRIPT_DIR is named "src" (repo layout: src/vuln_monitor.py)
-#   3. SCRIPT_DIR (script sits at data root)
-if os.getenv("VULN_DATA_DIR"):
-    DATA_DIR = Path(os.getenv("VULN_DATA_DIR")).resolve()
-elif SCRIPT_DIR.name == "src":
-    DATA_DIR = SCRIPT_DIR.parent
-else:
-    DATA_DIR = SCRIPT_DIR
+CFG = load_config()
+DATA_DIR = data_dir_from_config(CFG)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_FILE        = DATA_DIR / "vuln_cache.db"
@@ -107,10 +53,49 @@ LOG_FILE       = DATA_DIR / "vuln_monitor.log"
 CACHE_TTL_DAYS = 60
 ITEM_PER_FEED  = 50
 PUSH_SLEEP_SEC = 1.5
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = int(CFG["network"]["request_timeout"])
 LOG_MAX_BYTES  = 5 * 1024 * 1024
 LOG_BACKUPS    = 5
 ALERT_COOLDOWN_SEC = 3600
+PROXY = CFG["network"]["https_proxy"]
+TG_BOT_TOKEN = CFG["notify_telegram"]["bot_token"]
+TG_CHAT_IDS = CFG["notify_telegram"]["chat_ids"]
+GH_TOKENS = list(CFG["github"]["tokens"])
+NVD_API_KEY = CFG["nvd"]["api_key"]
+LLM_CFG = CFG["llm"]
+LLM_PROVIDER = LLM_CFG["provider"]
+LLM_API_KEY = LLM_CFG["api_key"]
+LLM_MODEL = LLM_CFG["model"]
+LLM_BASE_URL = LLM_CFG["base_url"]
+LLM_TEMPERATURE = float(LLM_CFG["temperature"])
+LLM_MAX_TOKENS = int(LLM_CFG["max_tokens"])
+LLM_TIMEOUT = int(LLM_CFG["timeout"])
+LLM_MAX_CONTEXT = int(LLM_CFG["max_context"])
+LLM_REASONING = LLM_CFG["reasoning_effort"]
+LLM_TOP_P = float(LLM_CFG["top_p"])
+GHSA_MAX_ITEMS = 300
+FETCH_PROGRESS_EVERY = 200
+MAX_RELATED_POC_URLS = 2
+_RUNTIME_ITEM_PER_FEED = ITEM_PER_FEED
+_RUNTIME_GHSA_MAX_ITEMS = GHSA_MAX_ITEMS
+
+
+def _feed_cap():
+    return _RUNTIME_ITEM_PER_FEED
+
+
+def _ghsa_cap():
+    return _RUNTIME_GHSA_MAX_ITEMS
+
+
+def _set_fetch_runtime(test_mode=False):
+    global _RUNTIME_ITEM_PER_FEED, _RUNTIME_GHSA_MAX_ITEMS
+    if test_mode:
+        _RUNTIME_ITEM_PER_FEED = min(3, ITEM_PER_FEED)
+        _RUNTIME_GHSA_MAX_ITEMS = min(20, GHSA_MAX_ITEMS)
+    else:
+        _RUNTIME_ITEM_PER_FEED = ITEM_PER_FEED
+        _RUNTIME_GHSA_MAX_ITEMS = GHSA_MAX_ITEMS
 
 RSS_FEEDS = [
     # ---- vendor PSIRT ----
@@ -137,6 +122,15 @@ RSS_FEEDS = [
     # GreyNoise (trend analysis, 10% CVE) — removed
     # SentinelLabs (research blog, 0% CVE) — removed
     # XuanwuLab (academic/research, low CVE density) — removed
+]
+
+TEST_RSS_FEEDS = [
+    ("Fortinet",    "https://www.fortiguard.com/rss/ir.xml"),
+    ("PaloAlto",    "https://security.paloaltonetworks.com/rss.xml"),
+    ("Cisco",       "https://sec.cloudapps.cisco.com/security/center/psirtrss20/CiscoSecurityAdvisory.xml"),
+    ("MSRC",        "https://api.msrc.microsoft.com/update-guide/rss"),
+    ("watchTowr",   "https://labs.watchtowr.com/rss/"),
+    ("ZDI",         "https://www.zerodayinitiative.com/rss/published/"),
 ]
 
 # CISA KEV uses a JSON endpoint (1500+ entries with structured fields, not RSS).
@@ -462,6 +456,8 @@ SESS.headers["User-Agent"] = "vuln-intel/1.0"
 if PROXY:
     SESS.proxies = {"http": PROXY, "https": PROXY}
 
+_gh_token_idx = 0
+
 _RETRY_ATTEMPTS = 3
 _RETRY_DELAY = 3
 
@@ -477,6 +473,58 @@ def _get_with_retry(session, url, **kwargs):
             log.debug(f"retry {attempt}/{_RETRY_ATTEMPTS} for {url}: {ex}")
             time.sleep(_RETRY_DELAY)
     return None  # unreachable
+
+
+def _github_rate_limited(resp):
+    body = ""
+    try:
+        body = resp.text.lower()
+    except Exception:
+        pass
+    return resp.status_code in (403, 429) or "secondary rate limit" in body
+
+
+def _next_github_token():
+    global _gh_token_idx
+    if not GH_TOKENS:
+        return None
+    token = GH_TOKENS[_gh_token_idx % len(GH_TOKENS)]
+    _gh_token_idx += 1
+    return token
+
+
+def _github_headers(token=None):
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _github_request(url, *, params=None, timeout=REQUEST_TIMEOUT, raw=False):
+    wait_sec = max(0, CFG["github"]["request_interval_sec"])
+    attempts = max(1, len(GH_TOKENS) or 1)
+    last_resp = None
+    tokens = GH_TOKENS[:] or [None]
+    for idx in range(attempts):
+        token = tokens[idx % len(tokens)]
+        try:
+            last_resp = _get_with_retry(
+                SESS,
+                url,
+                params=params,
+                headers=_github_headers(token),
+                timeout=timeout,
+            )
+        except Exception as ex:
+            log.warning(f"GitHub request err for {url}: {ex}")
+            last_resp = None
+        if last_resp is not None and not _github_rate_limited(last_resp):
+            if wait_sec:
+                time.sleep(wait_sec)
+            return last_resp
+        if wait_sec:
+            time.sleep(wait_sec)
+    return last_resp
 
 
 # ================== LOCK ==================
@@ -543,7 +591,8 @@ def _db():
     finally:
         conn.close()
 
-def init_db(conn):
+def _ensure_table_and_columns(conn):
+    """Ensure table shape exists. Safe for read paths against an existing DB."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS vulns (
             key        TEXT PRIMARY KEY,
@@ -564,10 +613,20 @@ def init_db(conn):
             llm_verified  INTEGER DEFAULT 0,
             llm_verdict   TEXT,
             llm_notes     TEXT,
-            tg_sent       INTEGER DEFAULT 0
+            tg_sent       INTEGER DEFAULT 0,
+            github_repo_url TEXT,
+            github_repo_name TEXT,
+            github_repo_desc TEXT,
+            github_repo_stars INTEGER,
+            github_primary_poc_url TEXT,
+            github_poc_index_url TEXT,
+            github_related_poc_urls TEXT,
+            github_poc_summary TEXT,
+            github_poc_readme_excerpt TEXT,
+            github_poc_found INTEGER DEFAULT 0,
+            github_poc_count INTEGER DEFAULT 0
         )
     """)
-    # migrate: add columns if missing (existing databases)
     _new_cols = []
     for col, typedef in [
         ("cve_published", "TEXT"),
@@ -580,12 +639,36 @@ def init_db(conn):
         ("freshness",     "TEXT"),
         ("freshness_reason", "TEXT"),
         ("vuln_type",     "TEXT"),
+        ("github_repo_url", "TEXT"),
+        ("github_repo_name", "TEXT"),
+        ("github_repo_desc", "TEXT"),
+        ("github_repo_stars", "INTEGER"),
+        ("github_primary_poc_url", "TEXT"),
+        ("github_poc_index_url", "TEXT"),
+        ("github_related_poc_urls", "TEXT"),
+        ("github_poc_summary", "TEXT"),
+        ("github_poc_readme_excerpt", "TEXT"),
+        ("github_poc_found", "INTEGER DEFAULT 0"),
+        ("github_poc_count", "INTEGER DEFAULT 0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE vulns ADD COLUMN {col} {typedef}")
             _new_cols.append(col)
         except sqlite3.OperationalError:
             pass
+    return _new_cols
+
+
+def _ensure_indexes(conn):
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cve_id     ON vulns(cve_id)     WHERE cve_id IS NOT NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_source     ON vulns(source)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON vulns(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pushed     ON vulns(pushed)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_verified ON vulns(llm_verified) WHERE llm_verified=0")
+
+
+def init_db(conn):
+    _new_cols = _ensure_table_and_columns(conn)
     # backfill tg_sent: mark already-pushed records as sent (only on first migration)
     if "tg_sent" in _new_cols:
         conn.execute("UPDATE vulns SET tg_sent = 1 WHERE pushed = 1")
@@ -604,13 +687,18 @@ def init_db(conn):
     # enforce hard locks on existing data: GitHub/nday must not remain pushed
     conn.execute("UPDATE vulns SET pushed=0 WHERE source IN ('GitHub','PoC-GitHub') AND pushed=1")
     conn.execute("UPDATE vulns SET pushed=0 WHERE freshness='nday' AND pushed=1")
+    _ensure_indexes(conn)
     conn.commit()
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_cve_id     ON vulns(cve_id)     WHERE cve_id IS NOT NULL")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_source     ON vulns(source)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON vulns(created_at)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pushed     ON vulns(pushed)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_verified ON vulns(llm_verified) WHERE llm_verified=0")
-    conn.commit()
+
+
+def init_db_readonly(conn):
+    """Best-effort schema compatibility for read-only commands.
+
+    Do not run data-fixing UPDATEs here, otherwise stats/query can block behind
+    a writer that is currently ingesting data.
+    """
+    _ensure_table_and_columns(conn)
+    _ensure_indexes(conn)
 
 def migrate_json_cache(conn):
     """One-time migration from vuln_cache.json → SQLite."""
@@ -642,12 +730,26 @@ def db_cleanup(conn):
 def _backfill_row(conn, key, it):
     """UPDATE a record's NULL fields with fresh data from a source item."""
     tag = _extract_id(it["text"], it["link"])
+    github = _github_context_from_item(it)
     conn.execute(
         "UPDATE vulns SET cve_id=COALESCE(cve_id,?), source=COALESCE(source,?), "
-        "title=COALESCE(title,?), link=COALESCE(link,?), summary=COALESCE(summary,?) "
+        "title=COALESCE(title,?), link=COALESCE(link,?), summary=COALESCE(summary,?), "
+        "github_repo_url=COALESCE(github_repo_url,?), github_repo_name=COALESCE(github_repo_name,?), "
+        "github_repo_desc=COALESCE(github_repo_desc,?), github_repo_stars=COALESCE(github_repo_stars,?), "
+        "github_primary_poc_url=COALESCE(github_primary_poc_url,?), github_poc_index_url=COALESCE(github_poc_index_url,?), "
+        "github_related_poc_urls=COALESCE(github_related_poc_urls,?), "
+        "github_poc_summary=COALESCE(github_poc_summary,?), github_poc_readme_excerpt=COALESCE(github_poc_readme_excerpt,?), "
+        "github_poc_found=CASE WHEN github_poc_found IS NULL OR github_poc_found=0 THEN ? ELSE github_poc_found END, "
+        "github_poc_count=CASE WHEN github_poc_count IS NULL OR github_poc_count=0 THEN ? ELSE github_poc_count END "
         "WHERE key=?",
         (tag if tag != "N/A" else None, it["source"],
-         it["title"][:300], it["link"], it["summary"][:500], key),
+         it["title"][:300], it["link"], it["summary"][:500],
+         github["github_repo_url"] or None, github["github_repo_name"] or None,
+         github["github_repo_desc"] or None, github["github_repo_stars"] or None,
+         github["github_primary_poc_url"] or None, github["github_poc_index_url"] or None,
+         github["github_related_poc_urls"] or None,
+         github["github_poc_summary"] or None, github["github_poc_readme_excerpt"] or None,
+         github["github_poc_found"], github["github_poc_count"], key),
     )
 
 def _infer_source_from_title(title):
@@ -752,6 +854,254 @@ def item_key(title, link, text):
     if link:
         return "u:" + hashlib.sha1(link.encode("utf-8")).hexdigest()[:16]
     return "h:" + hashlib.sha1((title + "|" + (link or "")).encode("utf-8")).hexdigest()[:16]
+
+
+_github_ctx_cache = {}
+
+
+def _json_urls(urls):
+    clean = []
+    seen = set()
+    for url in urls or []:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        clean.append(url)
+    return json.dumps(clean, ensure_ascii=False)
+
+
+def _decode_urls(payload):
+    if not payload:
+        return []
+    if isinstance(payload, list):
+        return [u for u in payload if isinstance(u, str) and u]
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [u for u in data if isinstance(u, str) and u]
+
+
+def _best_poc_repo(repos, cve_id):
+    if not repos:
+        return None
+    cve_low = (cve_id or "").lower()
+    def _score(repo):
+        name = (repo.get("full_name") or "").lower()
+        desc = (repo.get("description") or "").lower()
+        stars = int(repo.get("stargazers_count") or 0)
+        score = stars
+        if "nomi-sec/poc-in-github" in name:
+            score -= 1000
+        if cve_low and cve_low in name:
+            score += 200
+        if cve_low and cve_low in desc:
+            score += 50
+        if any(word in f"{name} {desc}" for word in ("poc", "exp", "exploit", "proof-of-concept", "proof of concept")):
+            score += 20
+        return score
+    return sorted(repos, key=_score, reverse=True)[0]
+
+
+def _github_context_from_item(item):
+    return {
+        "github_repo_url": item.get("github_repo_url") or item.get("link") or "",
+        "github_repo_name": item.get("github_repo_name") or item.get("title") or "",
+        "github_repo_desc": item.get("github_repo_desc") or item.get("summary") or "",
+        "github_repo_stars": int(item.get("github_repo_stars") or 0),
+        "github_primary_poc_url": item.get("github_primary_poc_url") or item.get("github_repo_url") or item.get("link") or "",
+        "github_poc_index_url": item.get("github_poc_index_url") or "",
+        "github_related_poc_urls": item.get("github_related_poc_urls") or _json_urls([]),
+        "github_poc_summary": item.get("github_poc_summary") or "",
+        "github_poc_readme_excerpt": item.get("github_poc_readme_excerpt") or "",
+        "github_poc_found": 1 if item.get("github_poc_found") else 0,
+        "github_poc_count": int(item.get("github_poc_count") or 0),
+    }
+
+
+def _empty_github_context():
+    return {
+        "github_repo_url": "",
+        "github_repo_name": "",
+        "github_repo_desc": "",
+        "github_repo_stars": 0,
+        "github_primary_poc_url": "",
+        "github_poc_index_url": "",
+        "github_related_poc_urls": _json_urls([]),
+        "github_poc_summary": "",
+        "github_poc_readme_excerpt": "",
+        "github_poc_found": 0,
+        "github_poc_count": 0,
+    }
+
+
+def _github_repo_readme(full_name):
+    if not CFG["github"]["fetch_readme_excerpt"] or not full_name:
+        return ""
+    resp = _github_request(f"https://api.github.com/repos/{full_name}/readme", timeout=15)
+    if not resp or resp.status_code != 200:
+        return ""
+    try:
+        payload = resp.json()
+    except Exception:
+        return ""
+    content = payload.get("content", "")
+    if not content:
+        return ""
+    try:
+        import base64
+
+        decoded = base64.b64decode(content).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    return re.sub(r"\s+", " ", decoded).strip()[:400]
+
+
+def _poc_summary(repo_name, desc, readme):
+    text = " ".join(part for part in [repo_name, desc, readme] if part)
+    if not text:
+        return "", 0
+    low = text.lower()
+    found = any(word in low for word in ("poc", "exp", "exploit", "proof of concept"))
+    snippets = []
+    if desc:
+        snippets.append(desc.strip())
+    if readme:
+        snippets.append(readme.strip())
+    summary = re.sub(r"\s+", " ", " ".join(snippets)).strip()[:220]
+    return summary, int(found)
+
+
+def _best_github_repo(items, cve_id):
+    if not items:
+        return None
+    cve_low = (cve_id or "").lower()
+    def score_repo(repo):
+        name = (repo.get("full_name") or "").lower()
+        desc = (repo.get("description") or "").lower()
+        stars = int(repo.get("stargazers_count") or 0)
+        hit = 50 if cve_low and cve_low in name else 0
+        hit += 20 if cve_low and cve_low in desc else 0
+        return (hit + stars, stars)
+    return sorted(items, key=score_repo, reverse=True)[0]
+
+
+def _github_nomi_context_for_cve(cve_id):
+    cve_upper = (cve_id or "").upper()
+    current_year = datetime.now(timezone.utc).year
+    for year in (current_year, current_year - 1):
+        raw_url = f"https://raw.githubusercontent.com/nomi-sec/PoC-in-GitHub/master/{year}/{cve_upper}.json"
+        index_url = f"https://github.com/nomi-sec/PoC-in-GitHub/blob/master/{year}/{cve_upper}.json"
+        resp = _github_request(raw_url, timeout=15)
+        if not resp or resp.status_code != 200:
+            continue
+        try:
+            repos = resp.json()
+        except Exception:
+            repos = []
+        if not isinstance(repos, list) or not repos:
+            continue
+        best = _best_poc_repo(repos, cve_upper)
+        if not best:
+            continue
+        readme = _github_repo_readme(best.get("full_name", "")) if CFG["github"]["fetch_poc_metadata"] else ""
+        summary, found = _poc_summary(best.get("full_name", ""), best.get("description", ""), readme)
+        return {
+            "github_repo_url": best.get("html_url", ""),
+            "github_repo_name": best.get("full_name", ""),
+            "github_repo_desc": (best.get("description") or "")[:300],
+            "github_repo_stars": int(best.get("stargazers_count") or 0),
+            "github_primary_poc_url": best.get("html_url", ""),
+            "github_poc_index_url": index_url,
+            "github_related_poc_urls": _json_urls([repo.get("html_url", "") for repo in repos[:MAX_RELATED_POC_URLS]]),
+            "github_poc_summary": summary,
+            "github_poc_readme_excerpt": readme,
+            "github_poc_found": int(found or bool(best.get("html_url"))),
+            "github_poc_count": len(repos),
+        }
+    return None
+
+
+def _github_context_for_cve(cve_id):
+    cve_upper = (cve_id or "").upper()
+    if not cve_upper.startswith("CVE-"):
+        return None
+    if cve_upper in _github_ctx_cache:
+        return _github_ctx_cache[cve_upper]
+    nomi_ctx = _github_nomi_context_for_cve(cve_upper)
+    if nomi_ctx:
+        _github_ctx_cache[cve_upper] = nomi_ctx
+        return nomi_ctx
+    resp = _github_request(
+        "https://api.github.com/search/repositories",
+        params={
+            "q": f"{cve_upper} in:name,description,readme",
+            "sort": "stars",
+            "order": "desc",
+            "per_page": CFG["github"]["max_repo_results"],
+        },
+        timeout=15,
+    )
+    if not resp or resp.status_code != 200:
+        _github_ctx_cache[cve_upper] = None
+        return None
+    try:
+        items = resp.json().get("items", [])
+    except Exception:
+        items = []
+    best = _best_github_repo(items, cve_upper)
+    if not best:
+        _github_ctx_cache[cve_upper] = None
+        return None
+    related_urls = [repo.get("html_url", "") for repo in items[: min(len(items), MAX_RELATED_POC_URLS)]]
+    readme = _github_repo_readme(best.get("full_name", "")) if CFG["github"]["fetch_poc_metadata"] else ""
+    summary, found = _poc_summary(best.get("full_name", ""), best.get("description", ""), readme)
+    ctx = {
+        "github_repo_url": best.get("html_url", ""),
+        "github_repo_name": best.get("full_name", ""),
+        "github_repo_desc": (best.get("description") or "")[:300],
+        "github_repo_stars": int(best.get("stargazers_count") or 0),
+        "github_primary_poc_url": best.get("html_url", ""),
+        "github_poc_index_url": "",
+        "github_related_poc_urls": _json_urls(related_urls),
+        "github_poc_summary": summary,
+        "github_poc_readme_excerpt": readme,
+        "github_poc_found": found,
+        "github_poc_count": len(items),
+    }
+    _github_ctx_cache[cve_upper] = ctx
+    return ctx
+
+
+def _test_candidate_score(item):
+    text = item.get("text", "")
+    source = item.get("source", "")
+    has_cve = bool(CVE_RE.search(text))
+    low = text.lower()
+    priority = 0
+    try:
+        hit, reason, vuln_type = score(text)
+    except Exception:
+        hit, reason, vuln_type = False, "", ""
+    if hit:
+        priority += 200
+    if reason == "excluded":
+        priority -= 200
+    if vuln_type == "RCE":
+        priority += 40
+    if source in HIGH_PRIORITY_SOURCES and has_cve:
+        priority += 100
+    if source in FRESH_SOURCES and has_cve:
+        priority += 50
+    if any(word in low for word in ("poc", "exp", "exploit", "proof of concept")):
+        priority += 25
+    if source in _GITHUB_SOURCES:
+        priority += 10
+    if source == "GHSA":
+        priority += 5
+    return priority
 
 
 # ================== FILTER ==================
@@ -859,11 +1209,9 @@ def _nvd_detail(cve_id):
     # fallback: GitHub Advisory Database (often has data before NVD, especially for OSS)
     time.sleep(1)  # Fix #11: rate limit coordination
     try:
-        hdrs = {"Accept": "application/vnd.github+json"}
-        if GH_TOKEN:
-            hdrs["Authorization"] = f"Bearer {GH_TOKEN}"
-        r = SESS.get("https://api.github.com/advisories",  # Fix #6: use SESS for proxy
-                     params={"cve_id": cve_upper}, headers=hdrs, timeout=10)
+        r = _github_request("https://api.github.com/advisories", params={"cve_id": cve_upper}, timeout=10)
+        if not r:
+            return None
         if r.status_code == 200 and r.json():
             adv = r.json()[0]
             pub_raw = adv.get("published_at", "")
@@ -1025,24 +1373,26 @@ def _backfill_nvd_severity(conn):
 # ================== LLM ENRICHMENT ==================
 # System prompt: load from DATA_DIR/llm_prompt.txt if exists, else use default.
 _LLM_PROMPT_FILE = DATA_DIR / "llm_prompt.txt"
-_LLM_SYSTEM_PROMPT_DEFAULT = """You are a vulnerability intelligence analyst. Determine whether a vulnerability is genuine and worth alerting on.
+_LLM_SYSTEM_PROMPT_DEFAULT = """你是一名漏洞情报分析师。请判断该漏洞是否真实、是否值得在企业内部告警。
 
-## Verdict categories:
-- confirmed: Genuine vulnerability affecting real, widely-deployed products. Worth pushing.
-- not_relevant: Real vulnerability but low practical impact — requires authentication + local access, niche product (<1000 deployments), info disclosure only with no escalation path. Not worth pushing.
-- noise: Not a real threat — fabricated CVE, personal project with 0 users, CTF/homework, marketing content, automated CVE reservation with no real impact.
+## Verdict 取值:
+- confirmed: 真实漏洞，且值得推送告警
+- not_relevant: 真实漏洞，但实际影响较低，不值得推送
+- noise: 噪声或无实际威胁，不值得关注
 
-## Rules:
-1. Vendor PSIRTs (Fortinet/Cisco/PaloAlto/MSRC) confirm the vulnerability is REAL — but real does not mean worth pushing. Still evaluate impact.
-2. "confirmed" requires: remotely exploitable OR high blast radius on widely-deployed products. RCE / command injection / SQL injection / auth bypass = confirmed.
-3. "not_relevant" for ANY of: DoS-only / crash-only, library-level bugs not directly exploitable in production, info disclosure with no escalation path, authenticated-only local exploits, niche products (<1000 deployments), Linux kernel subsystem patches (staging/ocfs2/fbdev/media/ALSA/i2c/s390).
-4. CVSS is a REFERENCE only — a high CVSS DoS is still not_relevant, a low CVSS pre-auth RCE is still confirmed.
-5. GitHub repos: check if the repo has actual exploit code vs empty placeholder. 0-star personal forks with no code = noise.
-6. Use tools to verify when title/summary is ambiguous.
-7. If you find a public exploit/PoC, mention it in notes — this is valuable intelligence.
+## 研判规则:
+1. Fortinet/Cisco/PaloAlto/MSRC 等官方 PSIRT 基本可确认漏洞真实，但“真实”不等于“值得推送”，仍需判断影响面。
+2. 满足以下情况通常应判为 confirmed：可远程利用、影响广泛部署产品、RCE、命令注入、SQL 注入、认证绕过、未授权高权限访问。
+3. 以下情况通常判为 not_relevant：仅 DoS/崩溃、仅信息泄露且无提权路径、必须认证后本地利用、非常小众产品、仅代码库级别缺陷但缺乏生产环境直接利用路径。
+4. CVSS 仅作参考，高 CVSS 的 DoS 仍可能不值得推送；低 CVSS 的预认证 RCE 仍可能值得推送。
+5. GitHub 仓库需要判断是否真有 PoC/Exp；空仓库、占位仓库、无代码的低质量 fork 更接近 noise。
+6. 如果标题或摘要不清晰，可以调用工具核实。
+7. 如果发现公开 PoC/Exp，请在 notes 中用中文简短说明。
 
-Output ONLY JSON (no markdown):
-{"verdict": "confirmed|not_relevant|noise", "notes": "one-sentence rationale"}
+严格只输出 JSON，不要输出 markdown，不要输出额外解释。
+notes 必须使用简体中文，控制在一句话内。
+输出格式:
+{"verdict": "confirmed|not_relevant|noise", "notes": "中文一句话说明"}
 """
 
 def _get_llm_prompt():
@@ -1108,10 +1458,10 @@ def _get_llm_client():
     except ImportError:
         log.error("openai package not installed. Run: pip install openai")
         return None, None
-    api_key = DEEPSEEK_API_KEY or OPENAI_API_KEY
+    api_key = LLM_API_KEY
     if not api_key:
         return None, None
-    if DEEPSEEK_API_KEY:
+    if (LLM_PROVIDER or "").lower() == "deepseek":
         base_url = LLM_BASE_URL or "https://api.deepseek.com"
         model = LLM_MODEL or "deepseek-chat"
     else:
@@ -1162,13 +1512,14 @@ def _tool_fetch_source_page(url):
         return json.dumps({"error": str(ex)})
 
 def _tool_search_github(cve_id):
-    headers = {"Accept": "application/vnd.github+json"}
-    if GH_TOKEN:
-        headers["Authorization"] = f"Bearer {GH_TOKEN}"
     try:
-        r = _get_with_retry(SESS, "https://api.github.com/search/repositories",
+        r = _github_request(
+            "https://api.github.com/search/repositories",
             params={"q": f"{cve_id} in:name,description", "sort": "stars", "per_page": 5},
-            headers=headers, timeout=15)
+            timeout=15,
+        )
+        if not r:
+            return json.dumps({"error": "request failed"})
         if r.status_code != 200:
             return json.dumps({"error": f"HTTP {r.status_code}"})
         repos = [{"name": rr["full_name"], "desc": (rr.get("description") or "")[:200],
@@ -1180,6 +1531,8 @@ def _tool_search_github(cve_id):
 
 def _tool_search_chaitin(keyword):
     s = requests.Session()
+    if PROXY:
+        s.proxies = {"http": PROXY, "https": PROXY}
     try:
         s.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://stack.chaitin.com/vuldb/index",
                           "Origin": "https://stack.chaitin.com", "Accept": "application/json"})
@@ -1376,7 +1729,7 @@ def fetch_rss(name, url):
         if getattr(d, "bozo", False) and not d.entries:
             log.warning(f"RSS {name} parse error: {getattr(d, 'bozo_exception', '')}")
             return out
-        for e in d.entries[:ITEM_PER_FEED]:
+        for e in d.entries[:_feed_cap()]:
             title   = (e.get("title") or "").strip()
             link    = (e.get("link") or "").strip()
             summary = re.sub(r"<[^>]+>", " ", e.get("summary", "") or "").strip()
@@ -1434,6 +1787,8 @@ def fetch_chaitin():
     """
     out = []
     s = requests.Session()
+    if PROXY:
+        s.proxies = {"http": PROXY, "https": PROXY}
     try:
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -1442,7 +1797,7 @@ def fetch_chaitin():
             "Accept": "application/json",
         })
         r = _get_with_retry(s, CHAITIN_API_URL,
-                  params={"limit": ITEM_PER_FEED, "offset": 0},
+                  params={"limit": _feed_cap(), "offset": 0},
                   timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             log.warning(f"Chaitin HTTP {r.status_code}")
@@ -1475,6 +1830,8 @@ def fetch_threatbook():
     """微步在线 ThreatBook — premium + highrisk vuln listings."""
     out = []
     s = requests.Session()
+    if PROXY:
+        s.proxies = {"http": PROXY, "https": PROXY}
     try:
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -1525,17 +1882,15 @@ def fetch_threatbook():
 def fetch_github_cve():
     out = []
     year = datetime.now().year
-    headers = {"Accept": "application/vnd.github+json"}
-    if GH_TOKEN:
-        headers["Authorization"] = f"Bearer {GH_TOKEN}"
     for q in (f"CVE-{year}-", f"CVE-{year - 1}-"):
         try:
-            r = _get_with_retry(SESS,
+            r = _github_request(
                 "https://api.github.com/search/repositories",
                 params={"q": f"{q} in:name", "sort": "updated", "order": "desc", "per_page": 30},
-                headers=headers,
                 timeout=REQUEST_TIMEOUT,
             )
+            if not r:
+                continue
             if r.status_code != 200:
                 log.warning(f"GitHub {q} status {r.status_code}: {r.text[:150]}")
                 continue
@@ -1545,16 +1900,27 @@ def fetch_github_cve():
                     continue
                 name = repo["full_name"]
                 desc = repo.get("description") or ""
+                poc_summary, poc_found = _poc_summary(name, desc, "")
                 out.append({
                     "source": "GitHub",
                     "title": name,
                     "link": repo["html_url"],
                     "summary": desc[:500],
                     "text": f"{name}\n{desc}",
+                    "github_repo_url": repo["html_url"],
+                    "github_repo_name": name,
+                    "github_repo_desc": desc[:300],
+                    "github_repo_stars": stars,
+                    "github_primary_poc_url": repo["html_url"],
+                    "github_poc_index_url": "",
+                    "github_related_poc_urls": _json_urls([repo["html_url"]]),
+                    "github_poc_summary": poc_summary,
+                    "github_poc_readme_excerpt": "",
+                    "github_poc_found": poc_found,
+                    "github_poc_count": 1,
                 })
         except Exception as ex:
             log.warning(f"GitHub {q} err: {ex}")
-        time.sleep(2)
     return out
 
 
@@ -1562,13 +1928,12 @@ def fetch_poc_in_github():
     """nomi-sec/PoC-in-GitHub: latest commit diff → new PoC repos for recent CVEs."""
     out = []
     year = datetime.now().year
-    headers = {"Accept": "application/vnd.github+json"}
-    if GH_TOKEN:
-        headers["Authorization"] = f"Bearer {GH_TOKEN}"
     try:
-        r = _get_with_retry(SESS,
+        r = _github_request(
             "https://api.github.com/repos/nomi-sec/PoC-in-GitHub/commits/master",
-            headers=headers, timeout=REQUEST_TIMEOUT)
+            timeout=REQUEST_TIMEOUT)
+        if not r:
+            return out
         if r.status_code != 200:
             log.warning(f"PoC-in-GitHub HTTP {r.status_code}")
             return out
@@ -1583,22 +1948,40 @@ def fetch_poc_in_github():
                 continue
             cve = cves[0].upper()
             raw_url = f.get("raw_url", "")
+            blob_url = f.get("blob_url", "") or f"https://github.com/nomi-sec/PoC-in-GitHub/blob/master/{fname}"
             # fetch the JSON to get PoC repo URLs
             if raw_url:
                 try:
-                    jr = SESS.get(raw_url, headers=headers, timeout=10)
+                    jr = _github_request(raw_url, timeout=10)
                     if jr.status_code == 200:
                         repos = jr.json() if isinstance(jr.json(), list) else []
+                        best_repo = _best_poc_repo(repos, cve)
+                        related_urls = [repo.get("html_url", "") for repo in repos[:MAX_RELATED_POC_URLS]]
+                        primary_url = best_repo.get("html_url", "") if best_repo else ""
+                        primary_name = best_repo.get("full_name", "") if best_repo else ""
+                        primary_desc = best_repo.get("description") or "" if best_repo else ""
                         for repo in repos[:3]:
                             name = repo.get("full_name", "")
                             desc = repo.get("description") or ""
                             html_url = repo.get("html_url", "")
+                            poc_summary, poc_found = _poc_summary(name, desc, "")
                             out.append({
                                 "source": "PoC-GitHub",
                                 "title": f"{cve} PoC: {name}",
                                 "link": html_url,
                                 "summary": desc[:500],
                                 "text": f"{cve} {name}\n{desc}",
+                                "github_repo_url": html_url,
+                                "github_repo_name": name,
+                                "github_repo_desc": desc[:300],
+                                "github_repo_stars": int(repo.get("stargazers_count") or 0),
+                                "github_primary_poc_url": primary_url or html_url,
+                                "github_poc_index_url": blob_url,
+                                "github_related_poc_urls": _json_urls(related_urls),
+                                "github_poc_summary": poc_summary,
+                                "github_poc_readme_excerpt": "",
+                                "github_poc_found": 1,
+                                "github_poc_count": len(repos),
                             })
                 except Exception:
                     pass
@@ -1614,29 +1997,37 @@ def fetch_github_advisories():
     Pulls critical + high severity in weekly windows.
     """
     out = []
-    headers = {"Accept": "application/vnd.github+json"}
-    if GH_TOKEN:
-        headers["Authorization"] = f"Bearer {GH_TOKEN}"
     now = datetime.now(timezone.utc)
+    total_added = 0
     for severity in ("critical", "high"):
         # slide 7-day windows over last 30 days
         for weeks_ago in range(5):
+            if total_added >= _ghsa_cap():
+                return out
             end = now - timedelta(days=weeks_ago * 7)
             start = end - timedelta(days=7)
             date_range = f"{start.strftime('%Y-%m-%d')}..{end.strftime('%Y-%m-%d')}"
             for page in (1, 2):
+                if total_added >= _ghsa_cap():
+                    return out
                 try:
-                    r = SESS.get("https://api.github.com/advisories",
-                                 params={"severity": severity, "published": date_range,
-                                         "sort": "published", "direction": "desc",
-                                         "per_page": 100, "page": page},
-                                 headers=headers, timeout=15)
+                    r = _github_request(
+                        "https://api.github.com/advisories",
+                        params={"severity": severity, "published": date_range,
+                                "sort": "published", "direction": "desc",
+                                "per_page": 100, "page": page},
+                        timeout=15,
+                    )
+                    if not r:
+                        break
                     if r.status_code != 200:
                         break
                     advs = r.json()
                     if not isinstance(advs, list) or not advs:
                         break
                     for adv in advs:
+                        if total_added >= _ghsa_cap():
+                            return out
                         cve = adv.get("cve_id") or adv.get("ghsa_id", "")
                         summary = adv.get("summary", "")
                         cvss = adv.get("cvss", {}).get("score")
@@ -1650,6 +2041,7 @@ def fetch_github_advisories():
                             "summary": f"{summary}{cvss_str}",
                             "text": f"{cve} {summary}",
                         })
+                        total_added += 1
                     if len(advs) < 100:
                         break  # no more pages for this window
                 except Exception as ex:
@@ -1660,21 +2052,36 @@ def fetch_github_advisories():
     return out
 
 
-def _fetch_all_sources():
+def _fetch_all_sources(test_mode=False, target_items=None):
     """Collect items from all configured sources. Used by _run() and cmd_rebuild()."""
     items = []
     counts = {}
-    for name, url in RSS_FEEDS:
+    rss_feeds = TEST_RSS_FEEDS if test_mode else RSS_FEEDS
+    extra_sources = (
+        [("CISA_KEV", fetch_kev_json), ("GHSA", fetch_github_advisories)]
+        if test_mode else
+        [("CISA_KEV", fetch_kev_json), ("Chaitin", fetch_chaitin),
+         ("ThreatBook", fetch_threatbook),
+         ("GitHub", fetch_github_cve), ("PoC-GitHub", fetch_poc_in_github),
+         ("GHSA", fetch_github_advisories)]
+    )
+    seed_target = max(6, (target_items or 0) * 4) if test_mode else None
+    for name, url in rss_feeds:
         batch = fetch_rss(name, url)
         counts[name] = len(batch)
         items.extend(batch)
-    for name, func in [("CISA_KEV", fetch_kev_json), ("Chaitin", fetch_chaitin),
-                        ("ThreatBook", fetch_threatbook),
-                        ("GitHub", fetch_github_cve), ("PoC-GitHub", fetch_poc_in_github),
-                        ("GHSA", fetch_github_advisories)]:
+        if test_mode and seed_target and len(items) >= seed_target:
+            log.info(f"test mode: seeded {len(items)} items from RSS, stopping source expansion early")
+            log.info("source counts: " + "  ".join(f"{k}={v}" for k, v in counts.items()))
+            return items
+    for name, func in extra_sources:
         batch = func()
         counts[name] = len(batch)
         items.extend(batch)
+        if test_mode and seed_target and len(items) >= seed_target:
+            log.info(f"test mode: seeded {len(items)} items after {name}, stopping source expansion early")
+            log.info("source counts: " + "  ".join(f"{k}={v}" for k, v in counts.items()))
+            return items
     log.info("source counts: " + "  ".join(f"{k}={v}" for k, v in counts.items()))
     return items
 
@@ -1695,19 +2102,191 @@ def _extract_id(text, link):
             return m.group()
     return "N/A"
 
+
+def _display_id(it):
+    cve_id = (it.get("cve_id") or "").strip().upper()
+    if cve_id.startswith("CVE-"):
+        return cve_id
+    return _extract_id(it.get("text", ""), it.get("link", ""))
+
+
+def _clean_text(value, limit=None):
+    text = html.unescape((value or "").strip())
+    text = re.sub(r"\s+", " ", text).strip()
+    if limit:
+        return text[:limit]
+    return text
+
+
+def _github_context_lines(it):
+    if not CFG["notify"]["include_github_context"]:
+        return []
+    repo = it.get("github_repo_name") or ""
+    url = it.get("github_repo_url") or ""
+    primary_url = it.get("github_primary_poc_url") or url
+    index_url = it.get("github_poc_index_url") or ""
+    related_urls = _decode_urls(it.get("github_related_poc_urls"))
+    desc = (it.get("github_poc_summary") or it.get("github_repo_desc") or "").strip()
+    found = "yes" if it.get("github_poc_found") else "no"
+    if not any([repo, url, primary_url, index_url, desc, related_urls]):
+        return []
+    lines = [f"GitHub: {repo or 'N/A'}", f"PoC: {found}"]
+    if primary_url:
+        lines.append(f"Primary PoC: {primary_url}")
+    if index_url:
+        lines.append(f"PoC Index: {index_url}")
+    if url and url != primary_url:
+        lines.append(f"Repo: {url}")
+    if related_urls:
+        lines.append(f"Related: {' | '.join(related_urls[:MAX_RELATED_POC_URLS])}")
+    if desc:
+        lines.append(f"Desc: {desc[:220]}")
+    return lines
+
+
 def format_msg(it, reason):
-    tag = _extract_id(it["text"], it["link"])
-    return (
+    tag = _display_id(it)
+    msg = (
         f"<b>[{tg_escape(it['source'])}]</b> <code>{tg_escape(tag)}</code>\n"
         f"<b>{tg_escape(it['title'][:220])}</b>\n"
         f"{tg_escape(it['link'])}\n"
         f"{tg_escape(it['summary'][:400])}\n"
         f"<i>match: {tg_escape(reason)}</i>"
-    )[:4000]
+    )
+    extra = _github_context_lines(it)
+    if extra:
+        msg += "\n" + "\n".join(tg_escape(line) for line in extra)
+    return msg[:4000]
+
+
+def _severity_meta(it, reason=None):
+    severity = (it.get("severity") or "").strip().lower()
+    cvss = it.get("cvss")
+    if severity in ("critical", "high", "medium", "low"):
+        label_map = {"critical": "严重", "high": "高危", "medium": "中危", "low": "低危"}
+        color_map = {"critical": "warning", "high": "warning", "medium": "info", "low": "comment"}
+        label = label_map[severity]
+        if cvss:
+            label = f"{label} (CVSS {cvss})"
+        return label, color_map[severity]
+    if "RCE" in (reason or ""):
+        return "高危", "warning"
+    return "待研判", "comment"
+
+
+def _reason_cn(reason):
+    mapping = {
+        "RCE+asset+CVE": "疑似可被远程未授权利用，且命中重点资产/厂商并存在 CVE 编号",
+        "RCE+CVE": "疑似可被远程利用，且存在 CVE 编号",
+        "RCE+asset": "疑似可被远程利用，且命中重点资产/厂商",
+        "excluded": "已命中过滤规则，不建议推送",
+        "no hit": "未命中有效漏洞规则",
+    }
+    return mapping.get(reason or "", reason or "待研判")
+
+
+def _vuln_type_cn(it, reason):
+    vuln_type = (it.get("vuln_type") or "").strip().lower()
+    if vuln_type == "rce":
+        return "远程代码执行"
+    if vuln_type == "other":
+        if "unauthorized" in ((it.get("title") or "") + " " + (it.get("summary") or "")).lower():
+            return "未授权访问 / 权限绕过"
+        return "高危漏洞"
+    if "unauthorized" in ((it.get("title") or "") + " " + (it.get("summary") or "")).lower():
+        return "未授权访问 / 权限绕过"
+    if "RCE" in (reason or ""):
+        return "远程代码执行"
+    return "待研判"
+
+
+def _llm_cn(it):
+    verdict = (it.get("llm_verdict") or "").strip()
+    notes = (it.get("llm_notes") or "").strip()
+    verdict_map = {
+        "confirmed": "确认值得关注",
+        "not_relevant": "相关性较低",
+        "noise": "噪声/不建议关注",
+    }
+    verdict_cn = verdict_map.get(verdict, "")
+    notes_clean = _clean_text(notes, 180)
+    if notes_clean and not re.search(r"[\u4e00-\u9fff]", notes_clean):
+        if verdict == "confirmed":
+            notes_clean = "官方通告及现有情报显示该漏洞真实存在，具备较高关注价值，建议优先排查和修复。"
+        elif verdict == "not_relevant":
+            notes_clean = "该漏洞真实存在，但结合现有情报判断实际利用价值较低，可降低优先级处理。"
+        elif verdict == "noise":
+            notes_clean = "当前公开情报不足以支持高价值告警，建议暂不作为重点漏洞处理。"
+    if verdict_cn and notes_clean:
+        return f"{verdict_cn}：{notes_clean}"
+    if verdict_cn:
+        return verdict_cn
+    if notes_clean:
+        return notes_clean
+    return ""
+
+
+def format_wecom_msg(it, reason):
+    tag = _display_id(it)
+    severity_label, severity_color = _severity_meta(it, reason)
+    primary_poc = it.get("github_primary_poc_url") or ""
+    poc_index = it.get("github_poc_index_url") or ""
+    related_urls = _decode_urls(it.get("github_related_poc_urls"))[:MAX_RELATED_POC_URLS]
+    llm_text = _llm_cn(it)
+    title = _clean_text(it.get("title"), 180)
+    summary = _clean_text(it.get("summary"), 220) or "暂无公开摘要"
+    source_name = _clean_text(it.get("source")) or "N/A"
+    reason_cn = _reason_cn(reason)
+    reference_lines = [f"- [官方公告]({it['link']})" if it.get("link") else "- 官方公告：无"]
+    if primary_poc:
+        reference_lines.append(f"- [主 PoC 链接]({primary_poc})")
+    if poc_index:
+        reference_lines.append(f"- [PoC 索引]({poc_index})")
+    for idx, url in enumerate(related_urls, 1):
+        reference_lines.append(f"- [其他参考PoC{idx}]({url})")
+    lines = [
+        "# <font color=\"warning\">漏洞安全告警</font>",
+        "",
+        "## 漏洞基本信息",
+        f"> **漏洞编号：** `{tag}`",
+        f"> **危险等级：** <font color=\"{severity_color}\">{severity_label}</font>",
+        f"> **漏洞类型：** {_vuln_type_cn(it, reason)}",
+        f"> **来源厂商：** {source_name}",
+    ]
+    if primary_poc:
+        lines.append(f"> **PoC/Exp：** [主 PoC 链接]({primary_poc})")
+    else:
+        lines.append("> **PoC/Exp：** 无")
+    if poc_index:
+        lines.append(f"> **PoC 索引：** [PoC-in-GitHub 索引]({poc_index})")
+    if related_urls:
+        links = " | ".join(f"[其他参考PoC{i+1}]({url})" for i, url in enumerate(related_urls))
+        lines.append(f"> **其他参考PoC：** {links}")
+    lines.extend([
+        "",
+        "## 漏洞概述",
+        f"**标题：** {title}",
+        "",
+        "## 风险说明",
+        f"**漏洞原理：** {summary}",
+        f"**影响范围：** 建议优先排查 `{source_name}` 对应产品及对外暴露的管理/API 面。",
+        f"**漏洞危害：** {reason_cn}",
+    ])
+    if llm_text:
+        lines.append(f"**LLM研判：** {llm_text}")
+    lines.extend([
+        "",
+        "## 修复及缓解方案",
+        "尽快核查受影响版本并参考官方公告完成升级或补丁修复；修复前建议限制管理面/API 暴露范围，并排查异常访问日志。",
+        "",
+        "## 参考链接",
+    ])
+    lines.extend(reference_lines)
+    return "\n".join(line for line in lines if line is not None)[:3900]
 
 def send_telegram(msg):
     if not (TG_BOT_TOKEN and TG_CHAT_IDS):
-        log.info(f"[DRY] {msg[:500]}")
+        log.info(f"[TG-DRY] {msg[:500]}")
         return True
     ok = True
     for chat_id in TG_CHAT_IDS:
@@ -1731,6 +2310,41 @@ def send_telegram(msg):
     return ok
 
 
+def send_wecom(msg):
+    webhook = CFG["notify_wecom"]["webhook_url"]
+    if not webhook:
+        log.info(f"[WECOM-DRY] {msg[:500]}")
+        return True
+    try:
+        r = SESS.post(
+            webhook,
+            json={"msgtype": "markdown", "markdown": {"content": msg[:3900]}},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            log.warning(f"WeCom push HTTP {r.status_code}: {r.text[:200]}")
+            return False
+        data = r.json()
+        if data.get("errcode") != 0:
+            log.warning(f"WeCom push err: {data}")
+            return False
+        return True
+    except Exception as ex:
+        log.warning(f"WeCom err: {ex}")
+        return False
+
+
+def send_notifications(it, reason):
+    channels = CFG["notify"]["enabled"] or [CFG["notify"]["default_channel"]]
+    ok = True
+    for channel in channels:
+        if channel == "telegram":
+            ok = send_telegram(format_msg(it, reason)) and ok
+        elif channel == "wecom":
+            ok = send_wecom(format_wecom_msg(it, reason)) and ok
+    return ok
+
+
 def send_failure_alert(msg):
     """Rate-limited error notification so silent cron breakage is noticed."""
     now = time.time()
@@ -1743,22 +2357,28 @@ def send_failure_alert(msg):
     if now - state.get("last_alert_ts", 0) < ALERT_COOLDOWN_SEC:
         log.warning(f"alert suppressed (cooldown): {msg[:150]}")
         return
-    if not (TG_BOT_TOKEN and TG_CHAT_IDS):
+    if not (CFG["notify_wecom"]["webhook_url"] or (TG_BOT_TOKEN and TG_CHAT_IDS)):
         log.error(f"[ALERT-DRY] {msg[:500]}")
     else:
-        for chat_id in TG_CHAT_IDS:
+        if CFG["notify_wecom"]["webhook_url"]:
             try:
-                SESS.post(
-                    f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": f"vuln-monitor error\n\n{msg[:3800]}",
-                        "disable_web_page_preview": True,
-                    },
-                    timeout=REQUEST_TIMEOUT,
-                )
+                send_wecom(f"**vuln-monitor error**\n\n{msg[:3600]}")
             except Exception as ex:
-                log.error(f"alert push {chat_id} failed: {ex}")
+                log.error(f"alert push wecom failed: {ex}")
+        if TG_BOT_TOKEN and TG_CHAT_IDS:
+            for chat_id in TG_CHAT_IDS:
+                try:
+                    SESS.post(
+                        f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": f"vuln-monitor error\n\n{msg[:3800]}",
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                except Exception as ex:
+                    log.error(f"alert push {chat_id} failed: {ex}")
     state["last_alert_ts"] = now
     try:
         tmp = ALERT_STATE.with_suffix(".tmp")
@@ -1769,148 +2389,206 @@ def send_failure_alert(msg):
 
 
 # ================== MAIN ==================
-def _run(no_push=False):
-    with _db() as conn:
-        init_db(conn)
-        migrate_json_cache(conn)
-        _warm_nvd_cache(conn)
-        now = datetime.now(timezone.utc).timestamp()
+def _run(no_push=False, max_items=None, test_mode=False):
+    _set_fetch_runtime(test_mode=test_mode)
+    try:
+        with _db() as conn:
+            init_db(conn)
+            migrate_json_cache(conn)
+            _warm_nvd_cache(conn)
+            now = datetime.now(timezone.utc).timestamp()
 
-        # detect cold start: if DB is empty, this is initial seeding — suppress push
-        _cold_start = conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0] == 0
+            # detect cold start: if DB is empty, this is initial seeding — suppress push
+            _cold_start = conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0] == 0
 
-        items = _fetch_all_sources()
-        log.info(f"collected {len(items)} items")
+            items = _fetch_all_sources(test_mode=test_mode, target_items=max_items)
+            if test_mode:
+                log.info("test mode active: using reduced source set and prioritizing pushable CVE items")
+                items = sorted(items, key=_test_candidate_score, reverse=True)
+            if max_items:
+                items = items[:max_items]
+                log.info(f"test cap: limiting fetch processing to {len(items)} items")
+            log.info(f"collected {len(items)} items")
 
-        seen_this_run = set()
-        pushed = 0
-        skipped_seen = 0
-        skipped_filter = 0
-        backfilled = 0
+            seen_this_run = set()
+            pushed = 0
+            skipped_seen = 0
+            skipped_filter = 0
+            backfilled = 0
+            processed = 0
 
-        for it in items:
-            key = item_key(it["title"], it["link"], it["text"])
-            if key in seen_this_run:
-                skipped_seen += 1
-                continue
+            for it in items:
+                processed += 1
+                if processed % FETCH_PROGRESS_EVERY == 0:
+                    log.info(
+                        f"processing progress: {processed}/{len(items)} "
+                        f"pushed={pushed} filtered={skipped_filter} seen={skipped_seen}"
+                    )
+                key = item_key(it["title"], it["link"], it["text"])
+                if key in seen_this_run:
+                    skipped_seen += 1
+                    continue
 
-            row = conn.execute("SELECT source, link FROM vulns WHERE key=?", (key,)).fetchone()
-            if row:
-                if row[0] is None or row[1] is None:
-                    _backfill_row(conn, key, it)
-                    backfilled += 1
-                skipped_seen += 1
+                row = conn.execute("SELECT source, link FROM vulns WHERE key=?", (key,)).fetchone()
+                if row:
+                    if row[0] is None or row[1] is None:
+                        _backfill_row(conn, key, it)
+                        backfilled += 1
+                    skipped_seen += 1
+                    seen_this_run.add(key)
+                    continue
                 seen_this_run.add(key)
-                continue
-            seen_this_run.add(key)
 
-            # ── Exploitability (severity) ──
-            hit, reason, vuln_type = score(it["text"])
+                # ── Exploitability (severity) ──
+                hit, reason, vuln_type = score(it["text"])
 
-            # ── Freshness — ALL records with CVE get cve_published + freshness ──
-            cve_pub = None
-            freshness = None
-            fresh_reason = None
-            if CVE_RE.search(it["text"]):
-                fresh, cve_pub, fresh_reason = _is_fresh(it["source"], it["text"])
-                freshness = "1day" if fresh else "nday"
-                if hit and not fresh:
-                    hit = False
-            elif it["source"] in FRESH_SOURCES:
-                # check source-provided publish date first (e.g. ThreatBook vuln_publish_time)
-                src_pub = it.get("_pub_date", "")
-                if src_pub:
-                    cve_pub = src_pub[:10]
-                    try:
-                        pub_dt = datetime.fromisoformat(src_pub[:10]).replace(tzinfo=timezone.utc)
-                        cutoff = datetime.now(timezone.utc) - timedelta(days=_FRESHNESS_DAYS)
-                        if pub_dt >= cutoff:
-                            freshness = "1day"
-                            fresh_reason = "source_pub_date"
-                        else:
-                            freshness = "nday"
-                            fresh_reason = "source_pub_date"
-                            hit = False
-                    except ValueError:
-                        freshness = "1day"
-                        fresh_reason = "high_trust_source"
-                else:
-                    # fallback: check advisory ID year (XVE-2023, FG-IR-24, etc.)
-                    year = datetime.now(timezone.utc).year
-                    id_year_m = re.search(r'(?:XVE|FG-IR|ZDI|PAN-SA)-(\d{4})', it["text"])
-                    if id_year_m and int(id_year_m.group(1)) < year - 1:
-                        freshness = "nday"
-                        fresh_reason = "old_advisory_id"
+                # ── Freshness — ALL records with CVE get cve_published + freshness ──
+                cve_pub = None
+                freshness = None
+                fresh_reason = None
+                if CVE_RE.search(it["text"]):
+                    fresh, cve_pub, fresh_reason = _is_fresh(it["source"], it["text"])
+                    freshness = "1day" if fresh else "nday"
+                    if hit and not fresh:
                         hit = False
+                elif it["source"] in FRESH_SOURCES:
+                    # check source-provided publish date first (e.g. ThreatBook vuln_publish_time)
+                    src_pub = it.get("_pub_date", "")
+                    if src_pub:
+                        cve_pub = src_pub[:10]
+                        try:
+                            pub_dt = datetime.fromisoformat(src_pub[:10]).replace(tzinfo=timezone.utc)
+                            cutoff = datetime.now(timezone.utc) - timedelta(days=_FRESHNESS_DAYS)
+                            if pub_dt >= cutoff:
+                                freshness = "1day"
+                                fresh_reason = "source_pub_date"
+                            else:
+                                freshness = "nday"
+                                fresh_reason = "source_pub_date"
+                                hit = False
+                        except ValueError:
+                            freshness = "1day"
+                            fresh_reason = "high_trust_source"
                     else:
-                        freshness = "1day"
-                        fresh_reason = "high_trust_source"
-            elif hit:
-                # low-trust source, no CVE → can't verify freshness
-                freshness = "nday"
-                fresh_reason = "no_cve_low_trust"
-                hit = False
+                        # fallback: check advisory ID year (XVE-2023, FG-IR-24, etc.)
+                        year = datetime.now(timezone.utc).year
+                        id_year_m = re.search(r'(?:XVE|FG-IR|ZDI|PAN-SA)-(\d{4})', it["text"])
+                        if id_year_m and int(id_year_m.group(1)) < year - 1:
+                            freshness = "nday"
+                            fresh_reason = "old_advisory_id"
+                            hit = False
+                        else:
+                            freshness = "1day"
+                            fresh_reason = "high_trust_source"
+                elif hit:
+                    # low-trust source, no CVE → can't verify freshness
+                    freshness = "nday"
+                    fresh_reason = "no_cve_low_trust"
+                    hit = False
 
-            tag = _extract_id(it["text"], it["link"])
-            cve_id = tag if tag != "N/A" else None
-            nvd = _nvd_detail_cache.get(cve_id.upper()) if cve_id and cve_id.startswith("CVE-") else None
-            nvd_severity = nvd["severity"] if nvd else None
-            nvd_cvss = nvd["cvss"] if nvd else None
-            should_push = hit and freshness == "1day" and it["source"] not in _GITHUB_SOURCES
-            conn.execute(
-                "INSERT OR IGNORE INTO vulns (key,cve_id,source,title,link,summary,reason,vuln_type,freshness,freshness_reason,pushed,created_at,cve_published,severity,cvss) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (key, cve_id, it["source"], it["title"][:300], it["link"],
-                 it["summary"][:500], reason, vuln_type, freshness, fresh_reason,
-                 1 if should_push else 0, now, cve_pub, nvd_severity, nvd_cvss),
-            )
-            if should_push:
-                pushed += 1
-            else:
-                skipped_filter += 1
+                tag = _extract_id(it["text"], it["link"])
+                cve_id = tag if tag != "N/A" else None
+                nvd = _nvd_detail_cache.get(cve_id.upper()) if cve_id and cve_id.startswith("CVE-") else None
+                nvd_severity = nvd["severity"] if nvd else None
+                nvd_cvss = nvd["cvss"] if nvd else None
+                should_push = hit and freshness == "1day" and it["source"] not in _GITHUB_SOURCES
+                github_ctx = _github_context_from_item(it) if it["source"] in _GITHUB_SOURCES else None
+                github_ctx = github_ctx or _empty_github_context()
+                conn.execute(
+                    "INSERT OR IGNORE INTO vulns "
+                    "(key,cve_id,source,title,link,summary,reason,vuln_type,freshness,freshness_reason,pushed,created_at,cve_published,severity,cvss,"
+                    "github_repo_url,github_repo_name,github_repo_desc,github_repo_stars,github_primary_poc_url,github_poc_index_url,github_related_poc_urls,github_poc_summary,github_poc_readme_excerpt,github_poc_found,github_poc_count) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (key, cve_id, it["source"], it["title"][:300], it["link"],
+                     it["summary"][:500], reason, vuln_type, freshness, fresh_reason,
+                     1 if should_push else 0, now, cve_pub, nvd_severity, nvd_cvss,
+                     github_ctx["github_repo_url"], github_ctx["github_repo_name"], github_ctx["github_repo_desc"],
+                     github_ctx["github_repo_stars"], github_ctx["github_primary_poc_url"], github_ctx["github_poc_index_url"], github_ctx["github_related_poc_urls"], github_ctx["github_poc_summary"], github_ctx["github_poc_readme_excerpt"],
+                     github_ctx["github_poc_found"], github_ctx["github_poc_count"]),
+                )
+                if should_push:
+                    pushed += 1
+                else:
+                    skipped_filter += 1
 
-        conn.commit()
-
-        # cold start: mark all records as already sent to prevent initial flood
-        if _cold_start:
-            suppressed = conn.execute("UPDATE vulns SET tg_sent=1 WHERE pushed=1 AND tg_sent=0").rowcount
             conn.commit()
-            if suppressed:
-                log.info(f"cold start: suppressed {suppressed} initial notifications (seeding run)")
 
-        db_cleanup(conn)
-        total = conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0]
-        log.info(
-            f"done: pushed={pushed}  filtered={skipped_filter}  already_seen={skipped_seen}  "
-            f"backfilled={backfilled}  db_size={total}"
-        )
+            # cold start: mark all records as already sent to prevent initial flood
+            if _cold_start and not test_mode:
+                suppressed = conn.execute("UPDATE vulns SET tg_sent=1 WHERE pushed=1 AND tg_sent=0").rowcount
+                conn.commit()
+                if suppressed:
+                    log.info(f"cold start: suppressed {suppressed} initial notifications (seeding run)")
 
-        # Send pending Telegram notifications (unless --no-push)
-        if not no_push:
-            _push_pending(conn)
+            db_cleanup(conn)
+            total = conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0]
+            log.info(
+                f"done: pushed={pushed}  filtered={skipped_filter}  already_seen={skipped_seen}  "
+                f"backfilled={backfilled}  db_size={total}"
+            )
+
+            # Send pending Telegram notifications (unless --no-push)
+            if not no_push:
+                _push_pending(conn)
+    finally:
+        _set_fetch_runtime(test_mode=False)
 
 
 def _push_pending(conn):
-    """Send Telegram for all pushed=1, tg_sent=0 records."""
+    """Send notifications for all pushed=1, tg_sent=0 records."""
     pending = conn.execute(
-        "SELECT key, cve_id, source, title, link, summary, reason, llm_verdict, llm_notes "
+        "SELECT key, cve_id, source, title, link, summary, reason, severity, cvss, vuln_type, llm_verdict, llm_notes, "
+        "github_repo_url, github_repo_name, github_repo_desc, github_repo_stars, github_primary_poc_url, github_poc_index_url, github_related_poc_urls, github_poc_summary, github_poc_readme_excerpt, github_poc_found, github_poc_count "
         "FROM vulns WHERE pushed=1 AND tg_sent=0"
     ).fetchall()
     if not pending:
         return
     sent = 0
-    for key, cve_id, source, title, link, summary, reason, verdict, notes in pending:
+    for key, cve_id, source, title, link, summary, reason, severity, cvss, vuln_type, verdict, notes, github_repo_url, github_repo_name, github_repo_desc, github_repo_stars, github_primary_poc_url, github_poc_index_url, github_related_poc_urls, github_poc_summary, github_poc_readme_excerpt, github_poc_found, github_poc_count in pending:
         it = {"source": source or "", "title": title or "", "link": link or "",
-              "summary": summary or "", "text": f"{title or ''}\n{summary or ''}"}
-        msg = format_msg(it, reason)
-        ok = send_telegram(msg)
+              "summary": summary or "", "text": f"{title or ''}\n{summary or ''}",
+              "cve_id": cve_id or "", "severity": severity or "", "cvss": cvss, "vuln_type": vuln_type or "",
+              "reason": reason or "", "llm_verdict": verdict or "", "llm_notes": notes or "",
+              "github_repo_url": github_repo_url or "", "github_repo_name": github_repo_name or "",
+              "github_repo_desc": github_repo_desc or "", "github_repo_stars": github_repo_stars or 0,
+              "github_primary_poc_url": github_primary_poc_url or "", "github_poc_index_url": github_poc_index_url or "", "github_related_poc_urls": github_related_poc_urls or _json_urls([]),
+              "github_poc_summary": github_poc_summary or "", "github_poc_readme_excerpt": github_poc_readme_excerpt or "",
+              "github_poc_found": github_poc_found or 0, "github_poc_count": github_poc_count or 0}
+        ok = send_notifications(it, reason)
         if ok:
             conn.execute("UPDATE vulns SET tg_sent=1 WHERE key=?", (key,))
             sent += 1
         time.sleep(PUSH_SLEEP_SEC)
     conn.commit()
     if sent:
-        log.info(f"push: sent {sent} Telegram notifications")
+        log.info(f"push: sent {sent} notifications")
+
+
+def cmd_notify(args):
+    """Resend or send pending notifications."""
+    with SingletonLock(LOCK_FILE):
+        with _db() as conn:
+            init_db(conn)
+            updated = 0
+            if getattr(args, "cve", None):
+                updated = conn.execute(
+                    "UPDATE vulns SET tg_sent=0 WHERE cve_id=? AND pushed=1",
+                    (args.cve.strip().upper(),),
+                ).rowcount
+            elif getattr(args, "latest", 0):
+                rows = conn.execute(
+                    "SELECT key FROM vulns WHERE pushed=1 ORDER BY created_at DESC LIMIT ?",
+                    (max(1, int(args.latest)),),
+                ).fetchall()
+                for (key,) in rows:
+                    updated += conn.execute("UPDATE vulns SET tg_sent=0 WHERE key=?", (key,)).rowcount
+            if updated:
+                conn.commit()
+                log.info(f"notify: reset {updated} records to pending")
+            if getattr(args, "dry", False):
+                print(f"pending reset: {updated}")
+                return
+            _push_pending(conn)
 
 
 # ================== TABLE FORMATTER ==================
@@ -1936,7 +2614,7 @@ def _query_rows(args, quality_filter=False):
       link IS NOT NULL, source IS NOT NULL, reason not in (no hit, excluded).
     """
     with _db() as conn:
-        init_db(conn)
+        init_db_readonly(conn)
         where, params = [], []
         if args.cve:
             where.append("cve_id LIKE ?"); params.append(f"%{args.cve}%")
@@ -2016,7 +2694,7 @@ def cmd_brief(args):
     explain = getattr(args, "explain", False)
     if explain:
         with _db() as conn:
-            init_db(conn)
+            init_db_readonly(conn)
             total = conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0]
             no_link = conn.execute("SELECT COUNT(*) FROM vulns WHERE link IS NULL OR link=''").fetchone()[0]
             placeholders = ",".join("?" for _ in STRONG_VULN_TYPES)
@@ -2049,7 +2727,7 @@ def cmd_brief(args):
 # ================== CLI: stats ==================
 def cmd_stats(args):
     with _db() as conn:
-        init_db(conn)
+        init_db_readonly(conn)
         total   = conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0]
         pushed  = conn.execute("SELECT COUNT(*) FROM vulns WHERE pushed=1").fetchone()[0]
         day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).timestamp()
@@ -2146,9 +2824,14 @@ def _cmd_rescore_inner():
 def cmd_enrich(args):
     """LLM-based vulnerability enrichment: NVD severity + LLM agent + push."""
     with SingletonLock(LOCK_FILE):
-        _cmd_enrich_inner(getattr(args, 'dry', False))
+        _cmd_enrich_inner(
+            getattr(args, 'dry', False),
+            limit=getattr(args, 'limit', 500),
+            prefer_github_context=getattr(args, 'prefer_github_context', False),
+            force_llm=getattr(args, 'force_llm', False),
+        )
 
-def _cmd_enrich_inner(dry=False):
+def _cmd_enrich_inner(dry=False, limit=500, prefer_github_context=False, force_llm=False):
     with _db() as conn:
         init_db(conn)
         _warm_nvd_cache(conn)
@@ -2157,7 +2840,7 @@ def _cmd_enrich_inner(dry=False):
         _backfill_nvd_severity(conn)
 
         # Phase 2: LLM enrichment
-        api_key = DEEPSEEK_API_KEY or OPENAI_API_KEY
+        api_key = LLM_API_KEY
         if not api_key:
             log.info("enrich: no LLM API key, skipping LLM enrichment")
         else:
@@ -2165,10 +2848,21 @@ def _cmd_enrich_inner(dry=False):
                 "SELECT key, cve_id, source, title, link, summary, reason, severity, cvss, freshness "
                 "FROM vulns WHERE llm_verified = 0 "
                 "AND reason NOT IN ('excluded', 'no hit') "
-                "ORDER BY created_at DESC LIMIT 500"
+                "ORDER BY created_at DESC LIMIT ?",
+                (max(1, limit),)
             ).fetchall()
 
             if candidates:
+                if prefer_github_context:
+                    candidates = sorted(
+                        candidates,
+                        key=lambda rec: (
+                            1 if (rec[1] and rec[1].startswith("CVE-")) else 0,
+                            1 if rec[2] in HIGH_PRIORITY_SOURCES else 0,
+                            1 if any(word in ((rec[3] or "") + " " + (rec[5] or "")).lower() for word in ("poc", "exp", "exploit")) else 0,
+                        ),
+                        reverse=True,
+                    )
                 # group by CVE to avoid duplicate LLM calls
                 by_cve = {}
                 no_cve = []
@@ -2186,12 +2880,12 @@ def _cmd_enrich_inner(dry=False):
                     rep = records[0]
                     any_high_trust = any(r[2] in HIGH_PRIORITY_SOURCES for r in records)
                     best_cvss = max((r[8] for r in records if r[8]), default=None)
-                    if any_high_trust and best_cvss and best_cvss >= 9.0:
+                    if (not force_llm) and any_high_trust and best_cvss and best_cvss >= 9.0:
                         for rec in records:
                             pushed_val = _resolve_pushed("confirmed", rec[9], rec[2])
                             conn.execute(
                                 "UPDATE vulns SET llm_verified=1, llm_verdict='confirmed', "
-                                "llm_notes='auto: high-trust + CVSS>=9.0', pushed=? WHERE key=?",
+                                "llm_notes='自动确认：高可信来源且 CVSS>=9.0', pushed=? WHERE key=?",
                                 (pushed_val, rec[0]))
                         auto_approved += len(records)
                         continue
@@ -2223,12 +2917,12 @@ def _cmd_enrich_inner(dry=False):
                     time.sleep(0.5)
 
                 conn.commit()
-                log.info(f"enrich: auto={auto_approved} llm={llm_processed} errors={llm_errors}")
+                log.info(f"enrich: auto={auto_approved} llm={llm_processed} errors={llm_errors} force_llm={1 if force_llm else 0}")
 
                 # fallback: too many LLM errors → push regex-scored items
                 if llm_errors > 3:
                     fallback = conn.execute(
-                        "UPDATE vulns SET llm_verified=1, llm_verdict='confirmed', llm_notes='fallback: LLM errors, regex-scored', pushed=1 "
+                        "UPDATE vulns SET llm_verified=1, llm_verdict='confirmed', llm_notes='兜底确认：LLM 多次失败，回退到规则命中结果', pushed=1 "
                         "WHERE llm_verified=0 AND vuln_type IN ('RCE','other') "
                         "AND freshness='1day' AND source NOT IN ('GitHub','PoC-GitHub')"
                     ).rowcount
@@ -2237,6 +2931,44 @@ def _cmd_enrich_inner(dry=False):
                         log.warning(f"enrich: LLM errors, fell back to regex for {fallback} records")
             else:
                 log.info("enrich: no unverified candidates")
+
+        # Phase 2.5: GitHub PoC/readme enrichment for recent interesting CVEs.
+        gh_candidates = conn.execute(
+            "SELECT key, cve_id, github_repo_name, github_repo_url, github_primary_poc_url, github_poc_index_url, github_related_poc_urls, github_poc_summary, github_poc_readme_excerpt "
+            "FROM vulns WHERE cve_id LIKE 'CVE-%' "
+            "AND freshness='1day' "
+            "AND (github_repo_url IS NULL OR github_repo_url='' OR github_primary_poc_url IS NULL OR github_primary_poc_url='' OR github_poc_readme_excerpt IS NULL OR github_poc_readme_excerpt='') "
+            "ORDER BY created_at DESC LIMIT 100"
+        ).fetchall()
+        gh_updated = 0
+        for key, cve_id, repo_name, repo_url, primary_poc_url, poc_index_url, related_poc_urls, poc_summary, readme_excerpt in gh_candidates:
+            ctx = _github_context_for_cve(cve_id)
+            if not ctx:
+                continue
+            conn.execute(
+                "UPDATE vulns SET "
+                "github_repo_url=COALESCE(NULLIF(github_repo_url,''),?), "
+                "github_repo_name=COALESCE(NULLIF(github_repo_name,''),?), "
+                "github_repo_desc=COALESCE(NULLIF(github_repo_desc,''),?), "
+                "github_repo_stars=CASE WHEN github_repo_stars IS NULL OR github_repo_stars=0 THEN ? ELSE github_repo_stars END, "
+                "github_primary_poc_url=COALESCE(NULLIF(github_primary_poc_url,''),?), "
+                "github_poc_index_url=COALESCE(NULLIF(github_poc_index_url,''),?), "
+                "github_related_poc_urls=COALESCE(NULLIF(github_related_poc_urls,''),?), "
+                "github_poc_summary=COALESCE(NULLIF(github_poc_summary,''),?), "
+                "github_poc_readme_excerpt=COALESCE(NULLIF(github_poc_readme_excerpt,''),?), "
+                "github_poc_found=CASE WHEN github_poc_found IS NULL OR github_poc_found=0 THEN ? ELSE github_poc_found END, "
+                "github_poc_count=CASE WHEN github_poc_count IS NULL OR github_poc_count=0 THEN ? ELSE github_poc_count END "
+                "WHERE key=?",
+                (
+                    ctx["github_repo_url"], ctx["github_repo_name"], ctx["github_repo_desc"],
+                    ctx["github_repo_stars"], ctx["github_primary_poc_url"], ctx["github_poc_index_url"], ctx["github_related_poc_urls"], ctx["github_poc_summary"], ctx["github_poc_readme_excerpt"],
+                    ctx["github_poc_found"], ctx["github_poc_count"], key,
+                ),
+            )
+            gh_updated += 1
+        if gh_updated:
+            conn.commit()
+            log.info(f"enrich: github-context updated {gh_updated} records")
 
         # Phase 3: push pending
         if not dry:
@@ -2276,7 +3008,7 @@ def _cmd_rebuild_inner():
 # ================== MAIN ==================
 def cmd_daemon(args):
     """Long-running daemon: fetch → enrich → sleep → repeat."""
-    interval = int(os.getenv("FETCH_INTERVAL", "300"))
+    interval = int(CFG["app"]["fetch_interval"])
     log.info(f"daemon started: interval={interval}s")
     while True:
         try:
@@ -2294,11 +3026,16 @@ def cmd_daemon(args):
 
 
 def main():
+    if not config_exists():
+        ensure_config_file()
+        print(f"NOTICE: created default config at {CONFIG_FILE}")
     parser = argparse.ArgumentParser(description="vuln-monitor: 0day/1day RCE intelligence")
     sub = parser.add_subparsers(dest="cmd")
 
     fp = sub.add_parser("fetch", help="Fetch all sources, dedup, store, push")
     fp.add_argument("--no-push", action="store_true", help="Do not send Telegram (for chained use with enrich)")
+    fp.add_argument("--test", action="store_true", help="Lightweight test mode: lower per-source volume and prioritize likely pushable CVE items")
+    fp.add_argument("--max-items", type=int, default=None, help="Only process the top N collected items this run")
 
     # shared filter args for query and brief
     def _add_filter_args(p):
@@ -2322,9 +3059,16 @@ def main():
     sub.add_parser("stats", help="Database statistics")
     sub.add_parser("rebuild", help="Re-fetch sources and backfill NULL fields in existing records")
     sub.add_parser("rescore", help="Re-evaluate all records with current scoring rules")
+    np = sub.add_parser("notify", help="Send pending notifications or resend selected pushed records")
+    np.add_argument("--cve", help="Resend a specific pushed CVE, e.g. CVE-2026-20223")
+    np.add_argument("--latest", type=int, default=0, help="Resend the latest N pushed records")
+    np.add_argument("--dry", action="store_true", help="Only reset to pending; do not send")
 
     ep = sub.add_parser("enrich", help="LLM-based enrichment: NVD severity + AI verdict + push")
-    ep.add_argument("--dry", action="store_true", help="Enrich but do not push to Telegram")
+    ep.add_argument("--dry", action="store_true", help="Enrich but do not push notifications")
+    ep.add_argument("--limit", type=int, default=500, help="Max candidate records to analyze this run")
+    ep.add_argument("--prefer-github-context", action="store_true", help="Prioritize CVE items more likely to have GitHub PoC context")
+    ep.add_argument("--force-llm", action="store_true", help="Bypass auto-approve and force LLM analysis for test validation")
 
     sub.add_parser("daemon", help="Long-running: fetch+enrich loop (env FETCH_INTERVAL=300)")
 
@@ -2342,6 +3086,18 @@ def main():
         cmd_rebuild(args)
     elif args.cmd == "rescore":
         cmd_rescore(args)
+    elif args.cmd == "notify":
+        try:
+            cmd_notify(args)
+        except RuntimeError as ex:
+            log.warning(str(ex))
+            sys.exit(0)
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            log.exception("notify error")
+            send_failure_alert(f"notify failed:\n{tb[-3500:]}")
+            sys.exit(1)
     elif args.cmd == "enrich":
         try:
             cmd_enrich(args)
@@ -2358,7 +3114,11 @@ def main():
         # default / "fetch": original behavior
         try:
             with SingletonLock(LOCK_FILE):
-                _run(no_push=getattr(args, 'no_push', False))
+                _run(
+                    no_push=getattr(args, 'no_push', False),
+                    max_items=getattr(args, 'max_items', None),
+                    test_mode=getattr(args, 'test', False),
+                )
         except RuntimeError as ex:
             log.warning(str(ex))
             sys.exit(0)

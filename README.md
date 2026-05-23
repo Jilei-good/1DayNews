@@ -1,6 +1,6 @@
 # vuln-monitor
 
-聚合多源 0day/1day RCE 情报，关键词过滤后推 Telegram + Web 仪表盘。面向安全研究员的个人订阅器。
+聚合多源 0day/1day RCE 情报，关键词过滤后推企业微信 / Telegram，并提供带登录鉴权的 Web 仪表盘。面向安全研究员和共享内网团队的订阅器。
 
 ## 核心特性
 
@@ -20,8 +20,9 @@
 ```bash
 git clone https://github.com/Knaithe/1DayNews.git && cd 1DayNews
 pip install -r requirements.txt
-python src/vuln_monitor.py fetch    # dry-run（不设 TG token 不推送）
-python src/web.py                   # Web 仪表盘 http://127.0.0.1:8001
+cp config.example.toml config.toml  # 填写通知 / GitHub / 代理 / 登录配置
+python src/vuln_monitor.py fetch    # 首次抓取
+python src/web.py                   # Web 仪表盘，默认读 config.toml 里的 host/port
 ```
 
 ## CLI 子命令
@@ -52,29 +53,55 @@ ssh -L 8001:127.0.0.1:8001 user@srv  # 远程 SSH 隧道访问
 
 Pluto Security 风格暖色卡片布局，实时搜索，药丸式源/原因/时间筛选，严重性颜色编码。默认只显示精选（pushed），可切换全量。安全加固（CSP/X-Frame-Options/nosniff），只读 SQLite + waitress，只绑 127.0.0.1。详见 [`docs/web-dashboard.md`](docs/web-dashboard.md)。
 
-## Telegram 推送
+## 配置文件
+
+统一使用项目根 `config.toml`：
+
+- `app`：Web 监听地址、轮询间隔、数据目录、是否要求登录
+- `network`：全局 `https_proxy`、请求超时
+- `auth`：前端登录用户名密码
+- `notify`：默认通知通道、是否附带 GitHub PoC 上下文
+- `notify.wecom`：企业微信机器人 webhook
+- `notify.telegram`：Telegram bot token / chat ids
+- `github`：多个 GitHub token、轮换间隔、PoC 元数据抓取
+- `nvd`：NVD API key
+- `llm`：LLM provider / key / model / base url
+
+示例见 [`config.example.toml`](config.example.toml)。
+
+## 通知
+
+### 企业微信（默认）
+
+```toml
+[notify]
+default_channel = "wecom"
+enabled = ["wecom"]
+
+[notify.wecom]
+webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+```
+
+### Telegram（可选）
 
 ```bash
-python scripts/configure.py          # 交互式配置 TG_BOT_TOKEN / TG_CHAT_ID
+python scripts/configure.py          # 交互式编辑 config.toml
 python src/vuln_monitor.py fetch     # 配置后自动推送
 ```
 
-支持多频道/群/个人同时推送：`TG_CHAT_ID=-100xxx,-100yyy,123456`
+支持企业微信和 Telegram 双通道同时开启。
 
-优先级：环境变量 > 配置文件 > 空（dry mode）。
-
-### 凭证配置
+### 凭证 / 关键配置
 
 | 变量 | 用途 | 获取 |
 |---|---|---|
-| `TG_BOT_TOKEN` | Telegram 推送 | @BotFather |
-| `TG_CHAT_ID` | 推送目标（逗号分隔多个） | @userinfobot / @RawDataBot |
-| `GH_TOKEN` | GitHub API 限频 60→5000 次/小时 | GitHub → Settings → Developer settings → PAT |
-| `NVD_API_KEY` | NVD API 限频 5→50 次/30 秒 | https://nvd.nist.gov/developers/request-an-api-key |
-| `DEEPSEEK_API_KEY` | LLM 研判（推荐，便宜） | https://platform.deepseek.com |
-| `OPENAI_API_KEY` | LLM 研判（备选） | https://platform.openai.com |
-| `LLM_MODEL` | 模型名（默认 deepseek-chat） | 可选 |
-| `LLM_BASE_URL` | 自定义 API 端点 | 可选，兼容任意 OpenAI 格式 |
+| `notify.wecom.webhook_url` | 企业微信机器人推送 | 企业微信群机器人 |
+| `notify.telegram.bot_token` | Telegram 推送 | @BotFather |
+| `notify.telegram.chat_ids` | Telegram 推送目标 | @userinfobot / @RawDataBot |
+| `github.tokens[]` | GitHub API 限频提升、PoC 查询、README 摘要 | GitHub PAT，可多个 |
+| `nvd.api_key` | NVD API 限频 5→50 次/30 秒 | https://nvd.nist.gov/developers/request-an-api-key |
+| `llm.api_key` | LLM 研判 | DeepSeek / OpenAI / 兼容端点 |
+| `network.https_proxy` | 统一代理 | Clash / V2Ray / 企业代理 |
 
 ### LLM 研判（可选）
 
@@ -209,7 +236,7 @@ LLM 会调用工具（查 NVD、抓源页面、搜 GitHub/长亭），高信任�
 
 不配 LLM key 时 enrich 跳过 LLM 步骤，直接走正则结果推送，不影响现有功能。
 
-部署后 `vuln-monitor.service` daemon 每 5 分钟自动执行 `fetch → enrich`，通过 `FETCH_INTERVAL` 环境变量调整间隔（秒）。
+部署后 `vuln-monitor.service` daemon 每 5 分钟自动执行 `fetch → enrich`。现在默认从 `config.toml` 的 `app.fetch_interval` 读取间隔（秒）。
 
 ## 一键部署
 

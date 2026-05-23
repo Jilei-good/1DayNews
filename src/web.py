@@ -1,105 +1,82 @@
 #!/usr/bin/env python3
-"""
-vuln-monitor web dashboard. Read-only SQLite viewer.
+"""Shared-access vuln-monitor dashboard with auth and config management."""
 
-Usage:
-    python src/web.py                          # localhost only
-    python src/web.py --public                 # 0.0.0.0 + magic token
-    python src/web.py --public --token MY_SEC  # custom token
-    ssh -L 8001:127.0.0.1:8001 user@srv       # SSH tunnel (no token needed)
-"""
+from __future__ import annotations
+
 import argparse
-import hmac
-import secrets
+import contextlib
+import json
 import sqlite3
-import os
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# NOTE: keep in sync with JS const MAX_LIMIT in DASHBOARD_HTML (substituted at module load)
-LIMIT_MAX = 500
-
-from flask import Flask, jsonify, request, abort
+import requests
+from flask import Flask, abort, jsonify, request, session
 from waitress import serve
 
-# ── Magic token auth ──
-_MAGIC_TOKEN = None  # set at startup if --public
-
-# ── Locate database ──
-SCRIPT_DIR = Path(__file__).resolve().parent
-if os.getenv("VULN_DATA_DIR"):
-    DATA_DIR = Path(os.getenv("VULN_DATA_DIR")).resolve()
-elif SCRIPT_DIR.name == "src":
-    DATA_DIR = SCRIPT_DIR.parent
-else:
-    DATA_DIR = SCRIPT_DIR
-DB_FILE = DATA_DIR / "vuln_cache.db"
-TOKEN_FILE = DATA_DIR / ".web_token"
-
-
-def _save_token(token):
-    """Persist token to file with restricted permissions."""
-    TOKEN_FILE.write_text(token, encoding="utf-8")
-    try:
-        os.chmod(TOKEN_FILE, 0o600)
-    except OSError:
-        pass
-
-
-def _load_or_create_token():
-    """Load token from file, or generate and persist a new one."""
-    if TOKEN_FILE.exists():
-        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
-        if token:
-            return token
-    token = secrets.token_hex(8)
-    _save_token(token)
-    return token
+try:
+    from config_utils import (
+        CONFIG_FILE,
+        config_exists,
+        config_status,
+        data_dir_from_config,
+        ensure_config_file,
+        ensure_session_secret,
+        load_config,
+        masked_config,
+        normalize_config,
+        save_config,
+    )
+except ModuleNotFoundError:
+    from .config_utils import (
+        CONFIG_FILE,
+        config_exists,
+        config_status,
+        data_dir_from_config,
+        ensure_config_file,
+        ensure_session_secret,
+        load_config,
+        masked_config,
+        normalize_config,
+        save_config,
+    )
 
 
-def _token_match(candidate):
-    """Constant-time token comparison to prevent timing attacks."""
-    if not _MAGIC_TOKEN or not candidate:
-        return False
-    return hmac.compare_digest(candidate, _MAGIC_TOKEN)
-
+LIMIT_MAX = 500
 app = Flask(__name__)
+app.secret_key = ensure_session_secret(load_config())["auth"]["session_secret"]
 
-@app.before_request
-def check_token():
-    if _MAGIC_TOKEN is None:
-        return  # localhost mode, no auth
-    # Allow token via: /TOKEN/path, ?token=TOKEN, or cookie
-    path_parts = request.path.strip("/").split("/", 1)
-    if _token_match(path_parts[0]):
-        # Strip token prefix, redirect to real path + set cookie
-        tail = path_parts[1] if len(path_parts) > 1 else ""
-        real_path = "/" + tail.lstrip("/")  # prevent //evil.com open redirect
-        from flask import redirect, make_response
-        resp = make_response(redirect(real_path))
-        resp.set_cookie("_vmt", _MAGIC_TOKEN, httponly=True, samesite="Strict", max_age=86400*30)
-        return resp
-    if _token_match(request.args.get("token", "")):
-        return
-    if _token_match(request.cookies.get("_vmt", "")):
-        return
-    abort(403)
+
+def current_config():
+    cfg = ensure_session_secret(load_config())
+    app.secret_key = cfg["auth"]["session_secret"]
+    return cfg
+
+
+def db_file():
+    return data_dir_from_config(current_config()) / "vuln_cache.db"
+
+
+def _session_ok():
+    cfg = current_config()
+    if not cfg["app"]["login_required"]:
+        return True
+    return bool(session.get("auth_ok"))
+
+
+def require_auth():
+    if not _session_ok():
+        abort(401)
+
 
 @app.after_request
 def no_cache(response):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src https://fonts.gstatic.com; "
-        "script-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; "
-        "connect-src 'self'; "
-        "frame-ancestors 'none'; "
-        "base-uri 'none'; "
-        "form-action 'self'"
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -107,16 +84,18 @@ def no_cache(response):
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     return response
 
-import contextlib
 
 @contextlib.contextmanager
 def get_db():
-    """Context manager for read-only DB access — guarantees close on exception."""
-    db_uri = f"file:{urllib.parse.quote(str(DB_FILE), safe='/:')}?mode=ro"
+    db = db_file()
+    if not db.exists():
+        yield None
+        return
+    db_uri = f"file:{urllib.parse.quote(str(db), safe='/:')}?mode=ro"
     try:
         conn = sqlite3.connect(db_uri, uri=True, timeout=5)
     except sqlite3.OperationalError:
-        conn = sqlite3.connect(str(DB_FILE), timeout=5)
+        conn = sqlite3.connect(str(db), timeout=5)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -125,7 +104,6 @@ def get_db():
 
 
 def _vulns_columns(conn):
-    """Set of column names in vulns table (for pre-migration DB compat)."""
     return {row[1] for row in conn.execute("PRAGMA table_info(vulns)")}
 
 
@@ -136,28 +114,227 @@ def _int_arg(name, default, lo, hi):
         return default
 
 
-# ── API ──
+def _to_bool(val):
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _clean_list(value):
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [line.strip() for line in value.splitlines() if line.strip()]
+    return []
+
+
+def _apply_config_update(payload):
+    cfg = current_config()
+    app_section = payload.get("app", {})
+    network = payload.get("network", {})
+    auth = payload.get("auth", {})
+    notify = payload.get("notify", {})
+    wecom = payload.get("notify_wecom", {})
+    telegram = payload.get("notify_telegram", {})
+    github = payload.get("github", {})
+    nvd = payload.get("nvd", {})
+    llm = payload.get("llm", {})
+
+    cfg["app"]["host"] = app_section.get("host", cfg["app"]["host"]) or cfg["app"]["host"]
+    cfg["app"]["port"] = int(app_section.get("port", cfg["app"]["port"]) or cfg["app"]["port"])
+    cfg["app"]["fetch_interval"] = int(app_section.get("fetch_interval", cfg["app"]["fetch_interval"]) or cfg["app"]["fetch_interval"])
+    cfg["app"]["data_dir"] = app_section.get("data_dir", cfg["app"]["data_dir"]) or cfg["app"]["data_dir"]
+    cfg["app"]["login_required"] = _to_bool(app_section.get("login_required", cfg["app"]["login_required"]))
+    cfg["network"]["https_proxy"] = network.get("https_proxy", cfg["network"]["https_proxy"])
+    cfg["network"]["request_timeout"] = int(network.get("request_timeout", cfg["network"]["request_timeout"]) or cfg["network"]["request_timeout"])
+    cfg["notify"]["default_channel"] = notify.get("default_channel", cfg["notify"]["default_channel"]) or cfg["notify"]["default_channel"]
+    cfg["notify"]["include_github_context"] = _to_bool(notify.get("include_github_context", cfg["notify"]["include_github_context"]))
+    cfg["notify"]["enabled"] = _clean_list(notify.get("enabled", cfg["notify"]["enabled"]))
+    cfg["notify_telegram"]["enabled"] = _to_bool(telegram.get("enabled", cfg["notify_telegram"]["enabled"]))
+    cfg["notify_telegram"]["chat_ids"] = _clean_list(telegram.get("chat_ids", cfg["notify_telegram"]["chat_ids"]))
+    cfg["notify_wecom"]["mentioned_list"] = _clean_list(wecom.get("mentioned_list", cfg["notify_wecom"]["mentioned_list"]))
+    cfg["notify_wecom"]["mentioned_mobile_list"] = _clean_list(wecom.get("mentioned_mobile_list", cfg["notify_wecom"]["mentioned_mobile_list"]))
+    cfg["github"]["request_interval_sec"] = int(github.get("request_interval_sec", cfg["github"]["request_interval_sec"]) or cfg["github"]["request_interval_sec"])
+    cfg["github"]["max_repo_results"] = int(github.get("max_repo_results", cfg["github"]["max_repo_results"]) or cfg["github"]["max_repo_results"])
+    cfg["github"]["fetch_readme_excerpt"] = _to_bool(github.get("fetch_readme_excerpt", cfg["github"]["fetch_readme_excerpt"]))
+    cfg["github"]["fetch_poc_metadata"] = _to_bool(github.get("fetch_poc_metadata", cfg["github"]["fetch_poc_metadata"]))
+    cfg["llm"]["provider"] = llm.get("provider", cfg["llm"]["provider"])
+    cfg["llm"]["base_url"] = llm.get("base_url", cfg["llm"]["base_url"])
+    cfg["llm"]["model"] = llm.get("model", cfg["llm"]["model"])
+    cfg["llm"]["temperature"] = float(llm.get("temperature", cfg["llm"]["temperature"]) or cfg["llm"]["temperature"])
+    cfg["llm"]["max_tokens"] = int(llm.get("max_tokens", cfg["llm"]["max_tokens"]) or cfg["llm"]["max_tokens"])
+    cfg["llm"]["timeout"] = int(llm.get("timeout", cfg["llm"]["timeout"]) or cfg["llm"]["timeout"])
+    cfg["llm"]["max_context"] = int(llm.get("max_context", cfg["llm"]["max_context"]) or cfg["llm"]["max_context"])
+    cfg["llm"]["reasoning_effort"] = llm.get("reasoning_effort", cfg["llm"]["reasoning_effort"])
+    cfg["llm"]["top_p"] = float(llm.get("top_p", cfg["llm"]["top_p"]) or cfg["llm"]["top_p"])
+
+    for section, key in [
+        ("auth", "admin_username"),
+        ("auth", "admin_password"),
+        ("notify_wecom", "webhook_url"),
+        ("notify_telegram", "bot_token"),
+        ("nvd", "api_key"),
+        ("llm", "api_key"),
+    ]:
+        source = {
+            "auth": auth,
+            "notify_wecom": wecom,
+            "notify_telegram": telegram,
+            "nvd": nvd,
+            "llm": llm,
+        }[section]
+        value = source.get(key)
+        if value not in (None, ""):
+            cfg[section][key] = value
+
+    token_lines = github.get("tokens")
+    if token_lines not in (None, ""):
+        cfg["github"]["tokens"] = _clean_list(token_lines)
+
+    save_config(normalize_config(cfg))
+    return current_config()
+
+
+def _test_wecom(cfg):
+    webhook = cfg["notify_wecom"]["webhook_url"]
+    if not webhook:
+        return {"ok": False, "detail": "wecom webhook not configured"}
+    session_obj = requests.Session()
+    if cfg["network"]["https_proxy"]:
+        session_obj.proxies = {"http": cfg["network"]["https_proxy"], "https": cfg["network"]["https_proxy"]}
+    try:
+        resp = session_obj.post(
+            webhook,
+            json={"msgtype": "markdown", "markdown": {"content": "**vuln-monitor test**\n\n配置测试成功。"}},
+            timeout=cfg["network"]["request_timeout"],
+        )
+        data = resp.json()
+        return {"ok": resp.status_code == 200 and data.get("errcode") == 0, "detail": data}
+    except Exception as ex:
+        return {"ok": False, "detail": str(ex)}
+
+
+def _test_telegram(cfg):
+    bot = cfg["notify_telegram"]["bot_token"]
+    chat_ids = cfg["notify_telegram"]["chat_ids"]
+    if not bot or not chat_ids:
+        return {"ok": False, "detail": "telegram bot_token/chat_ids not configured"}
+    session_obj = requests.Session()
+    if cfg["network"]["https_proxy"]:
+        session_obj.proxies = {"http": cfg["network"]["https_proxy"], "https": cfg["network"]["https_proxy"]}
+    try:
+        resp = session_obj.post(
+            f"https://api.telegram.org/bot{bot}/sendMessage",
+            json={"chat_id": chat_ids[0], "text": "vuln-monitor test\n\n配置测试成功。"},
+            timeout=cfg["network"]["request_timeout"],
+        )
+        return {"ok": resp.status_code == 200, "detail": resp.text[:200]}
+    except Exception as ex:
+        return {"ok": False, "detail": str(ex)}
+
+
+def _network_check(cfg):
+    endpoints = {
+        "github": "https://api.github.com/rate_limit",
+        "nvd": "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2024-3400",
+        "cisco": "https://sec.cloudapps.cisco.com/security/center/psirtrss20/CiscoSecurityAdvisory.xml",
+        "wecom": cfg["notify_wecom"]["webhook_url"] or "https://qyapi.weixin.qq.com/cgi-bin/webhook/send",
+    }
+    session_obj = requests.Session()
+    if cfg["network"]["https_proxy"]:
+        session_obj.proxies = {"http": cfg["network"]["https_proxy"], "https": cfg["network"]["https_proxy"]}
+    results = {}
+    for name, url in endpoints.items():
+        try:
+            resp = session_obj.get(url, timeout=cfg["network"]["request_timeout"])
+            results[name] = {"ok": resp.status_code < 500, "status": resp.status_code}
+        except Exception as ex:
+            results[name] = {"ok": False, "error": str(ex)}
+    return results
+
+
+@app.route("/api/auth/session")
+def api_session():
+    cfg = current_config()
+    return jsonify({
+        "authenticated": _session_ok(),
+        "login_required": cfg["app"]["login_required"],
+        "config_exists": config_exists(),
+    })
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_login():
+    cfg = current_config()
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get("username") == cfg["auth"]["admin_username"] and data.get("password") == cfg["auth"]["admin_password"]:
+        session["auth_ok"] = True
+        session.permanent = True
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "invalid credentials"}), 401
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/config/status")
+def api_config_status():
+    require_auth()
+    return jsonify(config_status(current_config()))
+
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    require_auth()
+    if request.method == "POST":
+        cfg = _apply_config_update(request.get_json(force=True, silent=True) or {})
+        return jsonify({"ok": True, "status": config_status(cfg)})
+    return jsonify(masked_config(current_config()))
+
+
+@app.route("/api/test-notify", methods=["POST"])
+def api_test_notify():
+    require_auth()
+    cfg = current_config()
+    return jsonify({
+        "wecom": _test_wecom(cfg),
+        "telegram": _test_telegram(cfg) if cfg["notify_telegram"]["enabled"] else {"ok": False, "detail": "telegram disabled"},
+    })
+
+
+@app.route("/api/network/check")
+def api_network_check():
+    require_auth()
+    return jsonify(_network_check(current_config()))
+
+
 @app.route("/api/vulns")
 def api_vulns():
+    require_auth()
     with get_db() as conn:
+        if conn is None:
+            return jsonify([])
         cols_avail = _vulns_columns(conn)
         where, params = [], []
         q = request.args.get("q", "").strip()
         if q:
-            where.append("(cve_id LIKE ? OR title LIKE ? OR summary LIKE ?)")
-            params.extend([f"%{q}%"] * 3)
+            where.append("(cve_id LIKE ? OR title LIKE ? OR summary LIKE ? OR github_repo_name LIKE ? OR github_poc_summary LIKE ?)")
+            params.extend([f"%{q}%"] * 5)
         source = request.args.get("source", "").strip()
         if source:
-            where.append("source = ?"); params.append(source)
+            where.append("source = ?")
+            params.append(source)
         vuln_type = request.args.get("vuln_type", "").strip()
         if vuln_type and "vuln_type" in cols_avail:
-            where.append("vuln_type = ?"); params.append(vuln_type)
+            where.append("vuln_type = ?")
+            params.append(vuln_type)
         severity = request.args.get("severity", "").strip().lower()
         if severity in ("critical", "high", "medium", "low"):
-            where.append("LOWER(severity) = ?"); params.append(severity)
-        reason = request.args.get("reason", "").strip()
-        if reason:
-            where.append("reason = ?"); params.append(reason)
+            where.append("LOWER(severity) = ?")
+            params.append(severity)
         pushed = request.args.get("pushed", "").strip()
         if pushed == "1":
             where.append("pushed = 1")
@@ -167,28 +344,28 @@ def api_vulns():
             cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
             where.append("(cve_published >= ? OR (cve_published IS NULL AND created_at > ?))")
             params.extend([cutoff_date, cutoff_ts])
-
-        # column list — drop optional ones missing in pre-migration DBs
-        base_cols = ["cve_id", "source", "title", "link", "summary", "reason", "pushed",
-                     "created_at", "cve_published", "severity", "cvss", "llm_verdict",
-                     "llm_notes", "tg_sent"]
-        optional_cols = ["vuln_type", "freshness"]
-        cols = base_cols + [c for c in optional_cols if c in cols_avail]
-        sql = f"SELECT {','.join(cols)} FROM vulns"
+        cols = [
+            "cve_id", "source", "title", "link", "summary", "reason", "pushed", "created_at",
+            "cve_published", "severity", "cvss", "llm_verdict", "llm_notes", "tg_sent",
+            "vuln_type", "freshness", "github_repo_url", "github_repo_name", "github_repo_desc",
+            "github_repo_stars", "github_primary_poc_url", "github_poc_index_url", "github_related_poc_urls", "github_poc_summary", "github_poc_readme_excerpt",
+            "github_poc_found", "github_poc_count",
+        ]
+        sql = f"SELECT {','.join(c for c in cols if c in cols_avail or c in ('cve_id','source','title','link','summary','reason','pushed','created_at','cve_published','severity','cvss','llm_verdict','llm_notes','tg_sent'))} FROM vulns"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY COALESCE(cve_published, strftime('%Y-%m-%d', created_at, 'unixepoch')) DESC, created_at DESC LIMIT ?"
-        limit = _int_arg("limit", 100, 1, LIMIT_MAX)
-        params.append(limit)
-
+        params.append(_int_arg("limit", 100, 1, LIMIT_MAX))
         rows = conn.execute(sql, params).fetchall()
-    has_vt = "vuln_type" in cols_avail
-    has_fr = "freshness" in cols_avail
     return jsonify([{
-        "id": r["cve_id"], "source": r["source"], "title": r["title"],
-        "url": r["link"], "summary": r["summary"], "reason": r["reason"],
-        "vuln_type": r["vuln_type"] if has_vt else None,
-        "freshness": r["freshness"] if has_fr else None,
+        "id": r["cve_id"],
+        "source": r["source"],
+        "title": r["title"],
+        "url": r["link"],
+        "summary": r["summary"],
+        "reason": r["reason"],
+        "vuln_type": r["vuln_type"] if "vuln_type" in r.keys() else None,
+        "freshness": r["freshness"] if "freshness" in r.keys() else None,
         "pushed": bool(r["pushed"]),
         "tg_sent": bool(r["tg_sent"]) if r["tg_sent"] is not None else None,
         "cve_published": r["cve_published"],
@@ -196,550 +373,463 @@ def api_vulns():
         "cvss": r["cvss"],
         "llm_verdict": r["llm_verdict"],
         "llm_notes": r["llm_notes"],
+        "github_repo_url": r["github_repo_url"] if "github_repo_url" in r.keys() else "",
+        "github_repo_name": r["github_repo_name"] if "github_repo_name" in r.keys() else "",
+        "github_repo_desc": r["github_repo_desc"] if "github_repo_desc" in r.keys() else "",
+        "github_repo_stars": r["github_repo_stars"] if "github_repo_stars" in r.keys() else 0,
+        "github_primary_poc_url": r["github_primary_poc_url"] if "github_primary_poc_url" in r.keys() else "",
+        "github_poc_index_url": r["github_poc_index_url"] if "github_poc_index_url" in r.keys() else "",
+        "github_related_poc_urls": r["github_related_poc_urls"] if "github_related_poc_urls" in r.keys() else "[]",
+        "github_poc_summary": r["github_poc_summary"] if "github_poc_summary" in r.keys() else "",
+        "github_poc_readme_excerpt": r["github_poc_readme_excerpt"] if "github_poc_readme_excerpt" in r.keys() else "",
+        "github_poc_found": r["github_poc_found"] if "github_poc_found" in r.keys() else 0,
+        "github_poc_count": r["github_poc_count"] if "github_poc_count" in r.keys() else 0,
         "date": r["cve_published"] or (datetime.fromtimestamp(r["created_at"], tz=timezone.utc).strftime("%Y-%m-%d") if r["created_at"] else None),
     } for r in rows])
 
 
 @app.route("/api/stats")
 def api_stats():
+    require_auth()
     with get_db() as conn:
+        if conn is None:
+            return jsonify({"total": 0, "pushed": 0, "sources": {}})
         total = conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0]
         pushed = conn.execute("SELECT COUNT(*) FROM vulns WHERE pushed=1").fetchone()[0]
         sources = conn.execute("SELECT source, COUNT(*) as n FROM vulns WHERE source IS NOT NULL GROUP BY source ORDER BY n DESC").fetchall()
-    return jsonify({
-        "total": total, "pushed": pushed,
-        "sources": {r["source"]: r["n"] for r in sources},
-    })
+    return jsonify({"total": total, "pushed": pushed, "sources": {r["source"]: r["n"] for r in sources}})
 
 
 @app.route("/api/sources")
 def api_sources():
+    require_auth()
     with get_db() as conn:
+        if conn is None:
+            return jsonify([])
         rows = conn.execute("SELECT DISTINCT source FROM vulns WHERE source IS NOT NULL ORDER BY source").fetchall()
     return jsonify([r["source"] for r in rows])
 
 
-# ── Frontend ──
 @app.route("/")
 def index():
-    return DASHBOARD_HTML
+    return HTML
 
 
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+HTML = r"""<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vuln-monitor</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23111013'/><path d='M29 8L29 54L42 54L42 92L71 42L54 42L71 8Z' fill='%23FFFF78'/></svg>">
-<style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root {
-  --cream: #FDF2D4; --sand: #E9DAAD; --peach: #FFB89F;
-  --white: #FFFFFF; --card: #FFFFFF;
-  --ink: #111013; --body: #2a2a2a; --muted: #6b6b6b;
-  --yellow: #FFFF78; --orange: #FA673A; --red: #EB2010;
-  --mint: #39BF97; --violet: #7C5CFC;
-  --radius: 20px; --pill: 100px;
-  --spring: cubic-bezier(.5, 2.5, .7, .7);
-  --shadow-hard: 4px 4px 0 var(--ink);
-  --shadow-soft: 2px 2px 0 var(--ink);
-}
-body {
-  background: var(--cream);
-  background-image:
-    radial-gradient(ellipse 80% 60% at 15% 10%, rgba(250,103,58,.10), transparent),
-    radial-gradient(ellipse 60% 50% at 85% 80%, rgba(255,255,120,.18), transparent);
-  color: var(--body); font-family: 'Poppins', -apple-system, sans-serif;
-  font-weight: 400; line-height: 1.5; min-height: 100vh;
-}
-a { color: var(--violet); text-decoration: none; }
-a:hover { text-decoration: underline; }
-
-/* ── Navbar (cream, slim: logo + tagline + search + Telegram-pushed toggle) ── */
-.nav { background: var(--cream); padding: 0 40px; position: sticky; top: 0; z-index: 20; border-bottom: 1px solid var(--ink); backdrop-filter: blur(6px); }
-.nav-inner { max-width: 1260px; margin: 0 auto; display: grid; grid-template-columns: auto 1fr auto; align-items: center; height: 60px; gap: 18px; }
-.nav-left { display: flex; align-items: center; gap: 18px; min-width: 0; }
-.nav-tagline { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.nav-logo {
-  font-family: 'Unbounded', sans-serif; font-weight: 800; font-size: 15px;
-  color: var(--ink); background: var(--yellow); padding: 6px 16px;
-  border-radius: var(--pill); letter-spacing: -.2px; white-space: nowrap;
-  border: 1px solid var(--ink); box-shadow: var(--shadow-soft);
-}
-.nav-search { width: 100%; max-width: 560px; justify-self: center; position: relative; }
-.nav-search input {
-  width: 100%; padding: 8px 18px 8px 42px; background: var(--white);
-  border: 1px solid var(--ink); border-radius: var(--pill);
-  color: var(--ink); font-family: inherit; font-size: 14px; outline: none;
-  transition: box-shadow .25s var(--spring);
-}
-.nav-search input:focus { box-shadow: var(--shadow-soft); }
-.nav-search input::placeholder { color: var(--muted); }
-.nav-search::before {
-  content: "\1F50D"; position: absolute; left: 16px; top: 50%;
-  transform: translateY(-50%); font-size: 14px; opacity: .5;
-}
-.nav-filters { display: flex; gap: 6px; align-items: center; }
-
-/* ── Pill-row filters (each filter its own row) ── */
-.filter-row { max-width: 1260px; margin: 10px auto 0; padding: 0 40px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-#timeRow { margin-top: 36px; }
-.group-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; min-width: 64px; }
-
-/* ── Hero / Stats ── */
-.hero { max-width: 1260px; margin: 0 auto; padding: 48px 40px 8px; }
-.hero-title {
-  font-family: 'Unbounded', sans-serif; font-weight: 800;
-  font-size: clamp(2rem, 4.5vw, 4.5rem);
-  color: var(--ink); letter-spacing: -.02em; line-height: 1.1;
-}
-.hero-title span { color: var(--red); }
-.hero-sub { color: var(--muted); font-size: 15px; margin-top: 10px; font-weight: 400; }
-
-.meta-row { max-width: 1260px; margin: 18px auto 0; padding: 0 40px; display: flex; align-items: baseline; justify-content: center; gap: 18px 28px; flex-wrap: wrap; }
-.stats { display: flex; gap: 28px; align-items: baseline; flex-wrap: wrap; }
-.stat-item { display: inline-flex; align-items: baseline; gap: 8px; }
-.stat-item + .stat-item { padding-left: 28px; border-left: 1px solid var(--ink); }
-.stat-num { font-family: 'Unbounded', sans-serif; font-size: 28px; font-weight: 800; color: var(--ink); line-height: 1; letter-spacing: -.02em; }
-.stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; white-space: nowrap; }
-@media (max-width: 900px) { .nav-tagline { display: none; } }
-
-/* ── Pushed toggle (switch) ── */
-.pushed-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--ink); cursor: pointer; user-select: none; }
-.pushed-toggle input { position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none; }
-.pushed-toggle .switch {
-  width: 36px; height: 20px; background: var(--white); border: 1px solid var(--ink);
-  border-radius: var(--pill); position: relative; transition: background .25s var(--spring);
-}
-.pushed-toggle input:focus-visible + .switch { outline: 2px solid var(--ink); outline-offset: 3px; }
-.pushed-toggle .switch::after {
-  content: ''; position: absolute; top: 2px; left: 2px;
-  width: 14px; height: 14px; background: var(--ink); border-radius: 50%;
-  transition: transform .25s var(--spring);
-}
-.pushed-toggle input:checked + .switch { background: var(--mint); }
-.pushed-toggle input:checked + .switch::after { transform: translateX(16px); }
-
-/* ── Category pills ── */
-.cat-row { max-width: 1260px; margin: 10px auto 0; padding: 0 40px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-.cat-pill {
-  font-family: inherit; line-height: 1.5;
-  padding: 6px 18px; border-radius: var(--pill); border: 1px solid var(--ink);
-  background: var(--white); font-size: 12px; font-weight: 600; color: var(--ink);
-  cursor: pointer; transition: all .25s var(--spring); user-select: none;
-}
-.cat-pill:hover { background: var(--yellow); transform: translateY(-2px); box-shadow: var(--shadow-soft); }
-.cat-pill:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
-.cat-pill.active { background: var(--ink); color: var(--yellow); }
-
-/* ── Vuln cards ── */
-.grid { max-width: 1260px; margin: 24px auto 0; padding: 0 40px 60px; display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 20px; }
-.vcard {
-  background: var(--card); border: 1px solid var(--ink); border-radius: var(--radius);
-  padding: 22px 24px 20px; display: flex; flex-direction: column; gap: 10px;
-  transition: transform .25s var(--spring), box-shadow .25s var(--spring);
-  position: relative;
-}
-.vcard:hover { transform: translateY(-4px); box-shadow: var(--shadow-hard); }
-.vcard-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.vcard-date { margin-left: auto; font-size: 12px; color: var(--muted); font-family: 'JetBrains Mono', monospace; font-weight: 500; }
-.src-badge {
-  display: inline-flex; align-items: center; padding: 3px 12px; border-radius: var(--pill);
-  border: 1px solid var(--ink);
-  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px;
-}
-.reason-badge {
-  padding: 2px 10px; border-radius: var(--pill); border: 1px solid var(--ink);
-  font-size: 10px; font-weight: 700;
-  text-transform: uppercase; letter-spacing: .3px;
-}
-.sev-badge {
-  padding: 2px 10px; border-radius: var(--pill); border: 1px solid var(--ink);
-  font-size: 10px; font-weight: 700; letter-spacing: .3px;
-  font-family: 'JetBrains Mono', monospace; color: var(--ink);
-}
-.sev-badge.sev-critical { background: #9B1C1C; color: var(--white); font-weight: 800; }
-.sev-badge.sev-high { background: var(--orange); color: var(--ink); }
-.sev-badge.sev-medium { background: var(--yellow); color: var(--ink); }
-.sev-badge.sev-low { background: var(--mint); color: var(--ink); }
-.pushed-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.pushed-dot.yes { background: var(--mint); box-shadow: 0 0 0 2px rgba(57,191,151,.25); }
-.pushed-dot.no { background: var(--muted); }
-.vcard-id {
-  display: inline-block; align-self: flex-start;
-  font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 600;
-  color: var(--ink); background: var(--sand);
-  padding: 3px 10px; border-radius: 8px; letter-spacing: .2px;
-}
-.vcard-title { font-size: 15px; font-weight: 700; color: var(--ink); line-height: 1.4; letter-spacing: -.005em; }
-.vcard-summary { font-size: 13px; color: var(--muted); line-height: 1.55; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.vcard-llm {
-  display: inline-flex; align-items: baseline; gap: 6px; max-width: 100%;
-  font-size: 12px; color: var(--body); line-height: 1.4;
-  border-left: 2px solid var(--violet); padding-left: 8px; cursor: help;
-}
-.vcard-llm .llm-prefix {
-  font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700;
-  color: var(--violet); letter-spacing: .5px;
-}
-.vcard-link { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.vcard-link a { color: var(--ink); font-weight: 500; border-bottom: 1px solid var(--ink); }
-.vcard-link a:hover { background: var(--yellow); text-decoration: none; }
-
-/* ── Load more ── */
-.load-more-row { max-width: 1260px; margin: 8px auto 32px; padding: 0 40px; display: flex; justify-content: center; }
-.load-more-btn {
-  font-family: inherit; font-size: 13px; font-weight: 700; color: var(--ink);
-  background: var(--white); border: 1px solid var(--ink); border-radius: var(--pill);
-  padding: 10px 28px; cursor: pointer; text-transform: uppercase; letter-spacing: .5px;
-  transition: all .25s var(--spring);
-}
-.load-more-btn:hover { background: var(--yellow); transform: translateY(-2px); box-shadow: var(--shadow-hard); }
-.load-more-btn:disabled { opacity: .5; cursor: default; transform: none; box-shadow: none; background: var(--white); }
-.load-more-row.hidden { display: none; }
-
-/* ── Skip link (a11y) ── */
-.skip-link {
-  position: absolute; top: -50px; left: 8px;
-  background: var(--ink); color: var(--yellow);
-  padding: 8px 18px; border-radius: var(--pill);
-  font-weight: 700; font-size: 13px; z-index: 100;
-  text-decoration: none; transition: top .15s;
-}
-.skip-link:focus { top: 8px; outline: 2px solid var(--yellow); outline-offset: 2px; }
-
-/* ── Empty / Loading ── */
-.empty { grid-column: 1/-1; text-align: center; padding: 80px 20px; color: var(--muted); }
-.loading { grid-column: 1/-1; text-align: center; padding: 60px; color: var(--muted); }
-.spinner { display: inline-block; width: 28px; height: 28px; border: 3px solid var(--sand); border-top-color: var(--orange); border-radius: 50%; animation: spin .7s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
-
-/* ── Footer ── */
-.footer { max-width: 1260px; margin: 0 auto; padding: 24px 40px; text-align: center; color: var(--muted); font-size: 12px; border-top: 1px solid var(--ink); }
-
-@media (max-width: 860px) {
-  .nav-inner { display: flex; flex-direction: column; align-items: stretch; height: auto; padding: 12px 0; gap: 10px; }
-  .nav-search { max-width: none; width: 100%; }
-  .nav-filters { align-self: flex-end; margin-left: 0; }
-  .hero-title { font-size: 28px; }
-  .grid { grid-template-columns: 1fr; }
-  .hero, .meta-row, .filter-row, .grid, .footer { padding-left: 16px; padding-right: 16px; }
-  .nav { padding: 0 16px; }
-}
-</style>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Unbounded:wght@400;600;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>1DayNews Console</title>
+  <style>
+    :root { --bg:#f6eddc; --ink:#131313; --card:#fffdf7; --line:#1a1a1a; --accent:#de5b31; --soft:#efd6a2; --ok:#2d8f6f; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:ui-sans-serif,system-ui,-apple-system,sans-serif; background:radial-gradient(circle at top left, #ffe5b2, transparent 30%), var(--bg); color:var(--ink); }
+    .wrap { max-width:1380px; margin:0 auto; padding:24px; }
+    .shell { display:grid; grid-template-columns:320px 1fr; gap:18px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:4px 4px 0 var(--line); }
+    .hidden { display:none !important; }
+    h1,h2,h3 { margin:0 0 12px; }
+    h1 { font-size:28px; }
+    h2 { font-size:18px; }
+    input, textarea, select, button { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#fff; font:inherit; }
+    textarea { min-height:88px; resize:vertical; }
+    button { cursor:pointer; background:var(--accent); color:#fff; font-weight:700; }
+    button.secondary { background:#fff; color:var(--ink); }
+    .grid { display:grid; gap:12px; }
+    .grid.two { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .pillrow { display:flex; gap:8px; flex-wrap:wrap; }
+    .pill { border:1px solid var(--line); border-radius:999px; padding:6px 12px; background:#fff; cursor:pointer; }
+    .pill.active { background:var(--ink); color:#fff3b5; }
+    .navbtn { text-align:left; background:#fff; color:var(--ink); }
+    .navbtn.active { background:var(--ink); color:#fff3b5; }
+    .stats { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+    .stat { padding:10px 14px; border:1px solid var(--line); border-radius:14px; background:#fff; min-width:140px; }
+    .vlist { display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); gap:16px; }
+    .vcard { border:1px solid var(--line); border-radius:16px; background:#fff; padding:16px; display:grid; gap:8px; }
+    .meta { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .badge { border:1px solid var(--line); border-radius:999px; padding:3px 10px; font-size:12px; background:#fff3b5; }
+    .muted { color:#5e5e5e; }
+    .small { font-size:12px; }
+    .status { white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,monospace; font-size:12px; background:#fff; border:1px dashed var(--line); border-radius:12px; padding:12px; }
+    .label { font-size:12px; font-weight:700; margin-bottom:6px; display:block; }
+    .right { display:grid; gap:18px; }
+    .github-box { border:1px dashed var(--line); border-radius:12px; padding:10px; background:#fff8e8; }
+    @media (max-width: 980px) { .shell, .grid.two { grid-template-columns:1fr; } }
+  </style>
 </head>
 <body>
-<a class="skip-link" href="#cardList">Skip to results</a>
+  <div class="wrap">
+    <h1>1DayNews Console</h1>
+    <div id="loginCard" class="card">
+      <h2>Login</h2>
+      <div class="grid">
+        <input id="username" placeholder="Username">
+        <input id="password" type="password" placeholder="Password">
+        <button id="loginBtn">Sign in</button>
+        <div id="loginMsg" class="muted small"></div>
+      </div>
+    </div>
 
-<nav class="nav">
-  <div class="nav-inner">
-    <div class="nav-left">
-      <div class="nav-logo">VULN-MONITOR</div>
-      <div class="nav-tagline">Real-time 1day/0day RCE tracking across <span id="srcCount">—</span> sources</div>
-    </div>
-    <div class="nav-search">
-      <input type="search" id="searchInput" placeholder="Search CVE, title, keyword..." aria-label="Search vulnerabilities by CVE, title, or keyword" autofocus>
-    </div>
-    <div class="nav-filters">
-      <label class="pushed-toggle" title="Show only items pushed to Telegram">
-        <input type="checkbox" id="pushedFilter" checked>
-        <span class="switch"></span>
-        <span>Telegram pushed</span>
-      </label>
+    <div id="appShell" class="shell hidden">
+      <div class="card grid">
+        <button class="navbtn active" data-view="dataView">Data</button>
+        <button class="navbtn" data-view="configView">Config</button>
+        <button class="navbtn" data-view="networkView">Network</button>
+        <button id="logoutBtn" class="secondary">Logout</button>
+        <div id="statusBox" class="status"></div>
+      </div>
+
+      <div class="right">
+        <section id="dataView" class="card">
+          <div class="stats" id="statsBar"></div>
+          <div class="grid two">
+            <input id="searchInput" placeholder="Search CVE, title, GitHub repo, PoC summary">
+            <select id="sourceSelect"><option value="">All sources</option></select>
+          </div>
+          <div class="pillrow" id="dayPills">
+            <button class="pill active" data-days="7">7 days</button>
+            <button class="pill" data-days="1">24h</button>
+            <button class="pill" data-days="30">30 days</button>
+            <button class="pill" data-days="60">60 days</button>
+            <button class="pill" data-days="">All</button>
+          </div>
+          <div style="margin:12px 0;">
+            <label><input id="pushedOnly" type="checkbox" checked style="width:auto;"> pushed only</label>
+          </div>
+          <div id="vulnList" class="vlist"></div>
+        </section>
+
+        <section id="configView" class="card hidden">
+          <h2>Config</h2>
+          <div class="grid two">
+            <div><span class="label">Host</span><input id="cfgHost"></div>
+            <div><span class="label">Port</span><input id="cfgPort" type="number"></div>
+            <div><span class="label">Fetch interval (sec)</span><input id="cfgInterval" type="number"></div>
+            <div><span class="label">Data dir</span><input id="cfgDataDir"></div>
+            <div><span class="label">HTTPS proxy</span><input id="cfgProxy" placeholder="http://127.0.0.1:7890"></div>
+            <div><span class="label">Request timeout</span><input id="cfgTimeout" type="number"></div>
+            <div><span class="label">Admin username</span><input id="cfgUser"></div>
+            <div><span class="label">Admin password</span><input id="cfgPass" type="password" placeholder="Leave blank to keep current"></div>
+            <div><span class="label">Default notify channel</span><select id="cfgDefaultChannel"><option value="wecom">wecom</option><option value="telegram">telegram</option></select></div>
+            <div><span class="label">Enabled channels</span><textarea id="cfgEnabledChannels" placeholder="wecom&#10;telegram"></textarea></div>
+            <div><span class="label">WeCom webhook</span><input id="cfgWecomWebhook" type="password" placeholder="Leave blank to keep current"></div>
+            <div><span class="label">Telegram bot token</span><input id="cfgTelegramToken" type="password" placeholder="Leave blank to keep current"></div>
+            <div><span class="label">Telegram enabled</span><select id="cfgTelegramEnabled"><option value="false">false</option><option value="true">true</option></select></div>
+            <div><span class="label">Telegram chat IDs</span><textarea id="cfgTelegramChats"></textarea></div>
+            <div><span class="label">GitHub tokens</span><textarea id="cfgGithubTokens" placeholder="One token per line. Leave blank to keep current."></textarea></div>
+            <div><span class="label">GitHub token summary</span><div id="cfgGithubSummary" class="status"></div></div>
+            <div><span class="label">GitHub request interval</span><input id="cfgGhInterval" type="number"></div>
+            <div><span class="label">GitHub max repo results</span><input id="cfgGhMax" type="number"></div>
+            <div><span class="label">NVD API key</span><input id="cfgNvdKey" type="password" placeholder="Leave blank to keep current"></div>
+            <div><span class="label">LLM provider</span><input id="cfgLlmProvider" placeholder="openai / deepseek"></div>
+            <div><span class="label">LLM API key</span><input id="cfgLlmKey" type="password" placeholder="Leave blank to keep current"></div>
+            <div><span class="label">LLM base URL</span><input id="cfgLlmBase"></div>
+            <div><span class="label">LLM model</span><input id="cfgLlmModel"></div>
+          </div>
+          <div class="grid two" style="margin-top:12px;">
+            <button id="saveConfigBtn">Save config</button>
+            <button id="testNotifyBtn" class="secondary">Test notification</button>
+          </div>
+          <div id="configMsg" class="status" style="margin-top:12px;"></div>
+        </section>
+
+        <section id="networkView" class="card hidden">
+          <h2>Network checks</h2>
+          <button id="networkCheckBtn">Run checks</button>
+          <div id="networkMsg" class="status" style="margin-top:12px;"></div>
+        </section>
+      </div>
     </div>
   </div>
-</nav>
-
-<main id="main">
-<div class="hero">
-  <h1 class="hero-title">Vulnerability <span>Intelligence</span></h1>
-</div>
-
-<div class="meta-row">
-  <div class="stats" id="statsBar"></div>
-</div>
-
-<div class="filter-row" id="timeRow" role="group" aria-label="Filter by time range">
-  <button type="button" class="cat-pill" data-days="">All Time</button>
-  <button type="button" class="cat-pill" data-days="1">24h</button>
-  <button type="button" class="cat-pill active" data-days="7">7 days</button>
-  <button type="button" class="cat-pill" data-days="30">30 days</button>
-  <button type="button" class="cat-pill" data-days="60">60 days</button>
-</div>
-
-<div class="filter-row" id="typeRow" role="group" aria-label="Filter by type">
-  <button type="button" class="cat-pill active" data-vtype="">All</button>
-  <button type="button" class="cat-pill" data-vtype="RCE">RCE</button>
-  <button type="button" class="cat-pill" data-vtype="other">other</button>
-</div>
-
-<div class="filter-row" id="sevRow" role="group" aria-label="Filter by severity">
-  <button type="button" class="cat-pill active" data-sev="">All</button>
-  <button type="button" class="cat-pill" data-sev="critical">Critical</button>
-  <button type="button" class="cat-pill" data-sev="high">High</button>
-  <button type="button" class="cat-pill" data-sev="medium">Medium</button>
-  <button type="button" class="cat-pill" data-sev="low">Low</button>
-</div>
-
-<div class="filter-row cat-row" id="catRow" role="group" aria-label="Filter by source"></div>
-
-<div class="grid" id="cardList" aria-live="polite" aria-busy="false"><div class="loading"><div class="spinner"></div><p style="margin-top:12px">Loading...</p></div></div>
-<div class="load-more-row hidden" id="loadMoreRow">
-  <button class="load-more-btn" id="loadMoreBtn" type="button">Load more</button>
-</div>
-</main>
-<div class="footer">vuln-monitor &middot; read-only</div>
-
-<script>
-const SRC_STYLE = {
-  CISA_KEV:  {bg:"#FFE0E0",fg:"#b91c1c"}, Fortinet: {bg:"#FFF3E0",fg:"#c2410c"},
-  PaloAlto:  {bg:"#FFFDE7",fg:"#92400e"}, Cisco:    {bg:"#E0F2FE",fg:"#0369a1"},
-  MSRC:      {bg:"#EDE9FE",fg:"#6d28d9"}, ZDI:      {bg:"#F3E8FF",fg:"#7c3aed"},
-  watchTowr: {bg:"#FCE7F3",fg:"#be185d"}, Horizon3: {bg:"#D1FAE5",fg:"#047857"},
-  Rapid7:    {bg:"#CFFAFE",fg:"#0e7490"}, Chaitin:  {bg:"#D1FAE5",fg:"#065f46"},
-  ThreatBook:{bg:"#E0F2FE",fg:"#0c4a6e"}, GitHub:   {bg:"#EDE9FE",fg:"#5b21b6"},
-  Sploitus_Citrix:{bg:"#FED7AA",fg:"#9a3412"}, Sploitus_Ivanti:{bg:"#FED7AA",fg:"#9a3412"},
-  Sploitus_F5:{bg:"#FED7AA",fg:"#9a3412"},
-};
-const TYPE_STYLE = {
-  "RCE":   {bg:"#FEE2E2",fg:"#991b1b"},
-  "other": {bg:"#FEF3C7",fg:"#92400e"},
-};
-
-let debounceTimer, activeCat = '', activeType = '', activeDays = '7', activeSeverity = '';
-let currentLimit = 100;
-const MAX_LIMIT = __LIMIT_MAX__;
-document.getElementById('loadMoreBtn').addEventListener('click', () => {
-  currentLimit = Math.min(currentLimit + 100, MAX_LIMIT);
-  loadVulns(true);
-});
-document.getElementById('searchInput').addEventListener('input', () => {
-  clearTimeout(debounceTimer); debounceTimer = setTimeout(loadVulns, 300);
-});
-document.getElementById('pushedFilter').addEventListener('change', () => loadVulns());
-
-function setActive(rowSelector, attr, val) {
-  document.querySelectorAll(rowSelector + ' .cat-pill').forEach(p => p.classList.toggle('active', p.dataset[attr] === val));
-}
-function updateCatPills() { setActive('#catRow', 'src', activeCat); }
-
-document.querySelectorAll('#timeRow .cat-pill').forEach(p => p.addEventListener('click', () => {
-  activeDays = p.dataset.days; setActive('#timeRow', 'days', activeDays); loadVulns();
-}));
-document.querySelectorAll('#typeRow .cat-pill').forEach(p => p.addEventListener('click', () => {
-  activeType = p.dataset.vtype; setActive('#typeRow', 'vtype', activeType); loadVulns();
-}));
-document.querySelectorAll('#sevRow .cat-pill').forEach(p => p.addEventListener('click', () => {
-  activeSeverity = p.dataset.sev; setActive('#sevRow', 'sev', activeSeverity); loadVulns();
-}));
-
-async function loadSources() {
-  try {
-    const sources = await (await fetch('/api/sources')).json();
-    const row = document.getElementById('catRow');
-    row.innerHTML = `<button type="button" class="cat-pill active" data-src="">All</button>` +
-      sources.map(s => `<button type="button" class="cat-pill" data-src="${esc(s)}">${esc(s)}</button>`).join('');
-    row.querySelectorAll('.cat-pill[data-src]').forEach(p => p.addEventListener('click', () => {
-      activeCat = p.dataset.src;
-      updateCatPills(); loadVulns();
+  <script>
+    let activeDays = '7';
+    async function jsonFetch(url, opts) {
+      const resp = await fetch(url, Object.assign({headers:{'Content-Type':'application/json'}}, opts||{}));
+      if (resp.status === 401) throw new Error('AUTH');
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || JSON.stringify(data));
+      return data;
+    }
+    function setView(id) {
+      document.querySelectorAll('[data-view]').forEach(btn => btn.classList.toggle('active', btn.dataset.view === id));
+      ['dataView','configView','networkView'].forEach(v => document.getElementById(v).classList.toggle('hidden', v !== id));
+    }
+    function showLogin(msg='') {
+      document.getElementById('loginCard').classList.remove('hidden');
+      document.getElementById('appShell').classList.add('hidden');
+      document.getElementById('loginMsg').textContent = msg;
+    }
+    function showApp() {
+      document.getElementById('loginCard').classList.add('hidden');
+      document.getElementById('appShell').classList.remove('hidden');
+    }
+    async function bootstrap() {
+      const sess = await jsonFetch('/api/auth/session');
+      if (!sess.login_required || sess.authenticated) {
+        showApp();
+        await Promise.all([loadStatus(), loadSources(), loadStats(), loadVulns(), loadConfig()]);
+      } else {
+        showLogin();
+      }
+    }
+    async function login() {
+      try {
+        await jsonFetch('/api/auth/login', {method:'POST', body:JSON.stringify({
+          username: document.getElementById('username').value.trim(),
+          password: document.getElementById('password').value
+        })});
+        showApp();
+        await Promise.all([loadStatus(), loadSources(), loadStats(), loadVulns(), loadConfig()]);
+      } catch (e) {
+        document.getElementById('loginMsg').textContent = e.message === 'AUTH' ? 'Unauthorized' : e.message;
+      }
+    }
+    async function logout() {
+      await jsonFetch('/api/auth/logout', {method:'POST'});
+      showLogin('Logged out');
+    }
+    async function loadStatus() {
+      try {
+        const data = await jsonFetch('/api/config/status');
+        document.getElementById('statusBox').textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        if (e.message === 'AUTH') return showLogin();
+      }
+    }
+    async function loadStats() {
+      try {
+        const stats = await jsonFetch('/api/stats');
+        document.getElementById('statsBar').innerHTML = `
+          <div class="stat"><div class="small muted">Total</div><div>${stats.total}</div></div>
+          <div class="stat"><div class="small muted">Pushed</div><div>${stats.pushed}</div></div>
+          <div class="stat"><div class="small muted">Sources</div><div>${Object.keys(stats.sources).length}</div></div>`;
+      } catch (e) { if (e.message === 'AUTH') showLogin(); }
+    }
+    async function loadSources() {
+      try {
+        const sources = await jsonFetch('/api/sources');
+        const select = document.getElementById('sourceSelect');
+        select.innerHTML = '<option value="">All sources</option>' + sources.map(s => `<option value="${s}">${s}</option>`).join('');
+      } catch (e) { if (e.message === 'AUTH') showLogin(); }
+    }
+    async function loadVulns() {
+      const params = new URLSearchParams();
+      const q = document.getElementById('searchInput').value.trim();
+      const source = document.getElementById('sourceSelect').value;
+      if (q) params.set('q', q);
+      if (source) params.set('source', source);
+      if (activeDays) params.set('days', activeDays);
+      if (document.getElementById('pushedOnly').checked) params.set('pushed', '1');
+      params.set('limit', '100');
+      try {
+        const vulns = await jsonFetch('/api/vulns?' + params.toString());
+        const root = document.getElementById('vulnList');
+        if (!vulns.length) {
+          root.innerHTML = '<div class="card">No data under current filters.</div>';
+          return;
+        }
+        root.innerHTML = vulns.map(v => {
+          const relatedUrls = parseUrlList(v.github_related_poc_urls).slice(0, 2);
+          return `
+          <div class="vcard">
+            <div class="meta">
+              <span class="badge">${v.source || '-'}</span>
+              <span class="badge">${v.id || 'N/A'}</span>
+              <span class="badge">${v.reason || '-'}</span>
+              <span class="badge">${v.date || '-'}</span>
+            </div>
+            <h3>${escapeHtml(v.title || '')}</h3>
+            <div class="muted">${escapeHtml((v.summary || '').slice(0, 280))}</div>
+            ${v.url ? `<a href="${safeUrl(v.url)}" target="_blank" rel="noreferrer">${escapeHtml(v.url)}</a>` : ''}
+            ${(v.github_repo_name || v.github_repo_url || v.github_primary_poc_url || v.github_poc_index_url || v.github_poc_summary) ? `
+              <div class="github-box">
+                <div><strong>GitHub</strong>: ${escapeHtml(v.github_repo_name || 'N/A')}</div>
+                ${v.github_primary_poc_url ? `<div><strong>Primary PoC</strong>: <a href="${safeUrl(v.github_primary_poc_url)}" target="_blank" rel="noreferrer">${escapeHtml(v.github_primary_poc_url)}</a></div>` : ''}
+                ${v.github_poc_index_url ? `<div><strong>PoC Index</strong>: <a href="${safeUrl(v.github_poc_index_url)}" target="_blank" rel="noreferrer">${escapeHtml(v.github_poc_index_url)}</a></div>` : ''}
+                ${v.github_repo_url && v.github_repo_url !== v.github_primary_poc_url ? `<div><strong>Repo</strong>: <a href="${safeUrl(v.github_repo_url)}" target="_blank" rel="noreferrer">${escapeHtml(v.github_repo_url)}</a></div>` : ''}
+                ${relatedUrls.length ? `<div class="small"><strong>Related</strong>: ${relatedUrls.map(url => `<a href="${safeUrl(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>`).join(' | ')}</div>` : ''}
+                <div>PoC found: ${v.github_poc_found ? 'yes' : 'no'} | repos: ${v.github_poc_count || 0} | stars: ${v.github_repo_stars || 0}</div>
+                ${v.github_poc_summary ? `<div class="small">${escapeHtml(v.github_poc_summary)}</div>` : ''}
+              </div>` : ''}
+            ${(v.llm_verdict || v.llm_notes) ? `
+              <div class="github-box">
+                <div><strong>LLM 研判</strong>: ${escapeHtml(llmVerdictLabel(v.llm_verdict))}</div>
+                ${v.llm_notes ? `<div class="small">${escapeHtml(v.llm_notes)}</div>` : ''}
+              </div>` : ''}
+          </div>`;
+        }).join('');
+      } catch (e) {
+        if (e.message === 'AUTH') return showLogin();
+        document.getElementById('vulnList').innerHTML = '<div class="card">Failed to load vulnerabilities.</div>';
+      }
+    }
+    async function loadConfig() {
+      try {
+        const cfg = await jsonFetch('/api/config');
+        document.getElementById('cfgHost').value = cfg.app.host;
+        document.getElementById('cfgPort').value = cfg.app.port;
+        document.getElementById('cfgInterval').value = cfg.app.fetch_interval;
+        document.getElementById('cfgDataDir').value = cfg.app.data_dir;
+        document.getElementById('cfgProxy').value = cfg.network.https_proxy;
+        document.getElementById('cfgTimeout').value = cfg.network.request_timeout;
+        document.getElementById('cfgUser').value = cfg.auth.admin_username;
+        document.getElementById('cfgDefaultChannel').value = cfg.notify.default_channel;
+        document.getElementById('cfgEnabledChannels').value = (cfg.notify.enabled || []).join('\n');
+        document.getElementById('cfgTelegramEnabled').value = String(cfg.notify_telegram.enabled);
+        document.getElementById('cfgTelegramChats').value = (cfg.notify_telegram.chat_ids || []).join('\n');
+        document.getElementById('cfgGithubSummary').textContent = JSON.stringify({token_count:(cfg.github.tokens || []).length, masked_tokens:cfg.github.tokens}, null, 2);
+        document.getElementById('cfgGhInterval').value = cfg.github.request_interval_sec;
+        document.getElementById('cfgGhMax').value = cfg.github.max_repo_results;
+        document.getElementById('cfgLlmProvider').value = cfg.llm.provider;
+        document.getElementById('cfgLlmBase').value = cfg.llm.base_url;
+        document.getElementById('cfgLlmModel').value = cfg.llm.model;
+      } catch (e) { if (e.message === 'AUTH') showLogin(); }
+    }
+    async function saveConfig() {
+      try {
+        const payload = {
+          app: {
+            host: document.getElementById('cfgHost').value.trim(),
+            port: document.getElementById('cfgPort').value,
+            fetch_interval: document.getElementById('cfgInterval').value,
+            data_dir: document.getElementById('cfgDataDir').value.trim(),
+            login_required: true
+          },
+          network: {
+            https_proxy: document.getElementById('cfgProxy').value.trim(),
+            request_timeout: document.getElementById('cfgTimeout').value
+          },
+          auth: {
+            admin_username: document.getElementById('cfgUser').value.trim(),
+            admin_password: document.getElementById('cfgPass').value
+          },
+          notify: {
+            default_channel: document.getElementById('cfgDefaultChannel').value,
+            enabled: document.getElementById('cfgEnabledChannels').value,
+            include_github_context: true
+          },
+          notify_wecom: {
+            webhook_url: document.getElementById('cfgWecomWebhook').value
+          },
+          notify_telegram: {
+            enabled: document.getElementById('cfgTelegramEnabled').value === 'true',
+            bot_token: document.getElementById('cfgTelegramToken').value,
+            chat_ids: document.getElementById('cfgTelegramChats').value
+          },
+          github: {
+            tokens: document.getElementById('cfgGithubTokens').value,
+            request_interval_sec: document.getElementById('cfgGhInterval').value,
+            max_repo_results: document.getElementById('cfgGhMax').value,
+            fetch_readme_excerpt: true,
+            fetch_poc_metadata: true
+          },
+          nvd: {
+            api_key: document.getElementById('cfgNvdKey').value
+          },
+          llm: {
+            provider: document.getElementById('cfgLlmProvider').value.trim(),
+            api_key: document.getElementById('cfgLlmKey').value,
+            base_url: document.getElementById('cfgLlmBase').value.trim(),
+            model: document.getElementById('cfgLlmModel').value.trim()
+          }
+        };
+        const data = await jsonFetch('/api/config', {method:'POST', body:JSON.stringify(payload)});
+        document.getElementById('configMsg').textContent = JSON.stringify(data, null, 2);
+        document.getElementById('cfgPass').value = '';
+        document.getElementById('cfgWecomWebhook').value = '';
+        document.getElementById('cfgTelegramToken').value = '';
+        document.getElementById('cfgGithubTokens').value = '';
+        document.getElementById('cfgNvdKey').value = '';
+        document.getElementById('cfgLlmKey').value = '';
+        await Promise.all([loadConfig(), loadStatus()]);
+      } catch (e) {
+        if (e.message === 'AUTH') return showLogin();
+        document.getElementById('configMsg').textContent = e.message;
+      }
+    }
+    async function testNotify() {
+      try {
+        const data = await jsonFetch('/api/test-notify', {method:'POST', body:'{}'});
+        document.getElementById('configMsg').textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        if (e.message === 'AUTH') return showLogin();
+        document.getElementById('configMsg').textContent = e.message;
+      }
+    }
+    async function runNetworkCheck() {
+      try {
+        const data = await jsonFetch('/api/network/check');
+        document.getElementById('networkMsg').textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        if (e.message === 'AUTH') return showLogin();
+        document.getElementById('networkMsg').textContent = e.message;
+      }
+    }
+    function escapeHtml(s) {
+      return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+    function parseUrlList(value) {
+      if (!value) return [];
+      if (Array.isArray(value)) return value.filter(Boolean);
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+      } catch {
+        return [];
+      }
+    }
+    function llmVerdictLabel(value) {
+      const mapping = {
+        confirmed: '确认值得关注',
+        not_relevant: '相关性较低',
+        noise: '噪声/不建议关注'
+      };
+      return mapping[value] || (value || 'N/A');
+    }
+    function safeUrl(u) {
+      try {
+        const url = new URL(u);
+        return ['http:','https:'].includes(url.protocol) ? u : '#';
+      } catch {
+        return '#';
+      }
+    }
+    document.getElementById('loginBtn').addEventListener('click', login);
+    document.getElementById('logoutBtn').addEventListener('click', logout);
+    document.getElementById('saveConfigBtn').addEventListener('click', saveConfig);
+    document.getElementById('testNotifyBtn').addEventListener('click', testNotify);
+    document.getElementById('networkCheckBtn').addEventListener('click', runNetworkCheck);
+    document.getElementById('searchInput').addEventListener('input', () => setTimeout(loadVulns, 100));
+    document.getElementById('sourceSelect').addEventListener('change', loadVulns);
+    document.getElementById('pushedOnly').addEventListener('change', loadVulns);
+    document.querySelectorAll('#dayPills .pill').forEach(btn => btn.addEventListener('click', () => {
+      document.querySelectorAll('#dayPills .pill').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      activeDays = btn.dataset.days;
+      loadVulns();
     }));
-  } catch(e) { console.error('loadSources failed', e); }
-}
-
-async function loadStats() {
-  try {
-    const d = await (await fetch('/api/stats')).json();
-    const srcCount = Object.keys(d.sources).length;
-    document.getElementById('statsBar').innerHTML = `
-      <span class="stat-item"><span class="stat-num">${d.total}</span><span class="stat-label">Total Vulns</span></span>
-      <span class="stat-item"><span class="stat-num">${d.pushed}</span><span class="stat-label">Pushed</span></span>
-      <span class="stat-item"><span class="stat-num">${srcCount}</span><span class="stat-label">Active Sources</span></span>
-    `;
-    document.getElementById('srcCount').textContent = srcCount;
-  } catch(e) { console.error('loadStats failed', e); }
-}
-
-function esc(s) {
-  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-                .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
-function safeUrl(u) {
-  if (!u) return '#';
-  try {
-    const p = new URL(u, 'http://x/');
-    if (p.protocol !== 'http:' && p.protocol !== 'https:') return '#';
-    return u.replace(/&/g,'&amp;').replace(/"/g,'&quot;');
-  } catch(e) { return '#'; }
-}
-function _cvssToTier(score) {
-  if (score >= 9.0) return 'critical';
-  if (score >= 7.0) return 'high';
-  if (score >= 4.0) return 'medium';
-  return 'low';
-}
-function _parseCvssFromText(text) {
-  // Covers both: "CVSSv3 Score: 6.7" (Fortinet) and "CVSS rating of 7.5" (ZDI).
-  // Verified 99/99 hit-rate on real DB.
-  if (!text) return null;
-  const m = String(text).match(/CVSS\s*(?:v\d(?:\.\d)?)?\s*(?:Score|rating)?\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)/i);
-  if (!m) return null;
-  const score = parseFloat(m[1]);
-  return (isNaN(score) || score < 0 || score > 10) ? null : score;
-}
-function _resolveSeverity(v) {
-  // Returns { sev: 'CRITICAL'|... or '', cvss: number|null } from DB → summary regex → title heuristic
-  let sev = v.severity ? String(v.severity).toUpperCase() : '';
-  let cvss = (typeof v.cvss === 'number') ? v.cvss : null;
-  if (!sev || cvss === null) {
-    const parsed = _parseCvssFromText(v.summary);
-    if (parsed !== null) {
-      if (cvss === null) cvss = parsed;
-      if (!sev) sev = _cvssToTier(parsed).toUpperCase();
-    }
-  }
-  return { sev, cvss };
-}
-function sevClass(v) {
-  // Prefer real DB severity → CVSS-derived → title-keyword heuristic
-  const { sev } = _resolveSeverity(v);
-  if (sev && ['CRITICAL','HIGH','MEDIUM','LOW'].includes(sev)) return 'sev-' + sev.toLowerCase();
-  const t = ((v && v.title) || '').toLowerCase();
-  if (t.includes('critical') || t.includes('[kev]')) return 'sev-critical';
-  if (t.includes('rce') || t.includes('pre-auth') || t.includes('remote code')) return 'sev-high';
-  if (t.includes('overflow') || t.includes('injection')) return 'sev-medium';
-  return 'sev-low';
-}
-function sevBadge(v) {
-  const { sev, cvss } = _resolveSeverity(v);
-  if (!sev && cvss === null) return '';
-  const cls = sev ? 'sev-' + sev.toLowerCase() : 'sev-low';
-  const prefix = sev === 'CRITICAL' ? '▲&nbsp;' : '';  // ▲ warning triangle for CRITICAL
-  const cvssStr = cvss !== null ? cvss.toFixed(1) : '';
-  return `<span class="sev-badge ${cls}">${prefix}${esc(sev || '?')}${cvssStr ? ` &middot; ${cvssStr}` : ''}</span>`;
-}
-
-async function loadVulns(append=false) {
-  if (!append) currentLimit = 100;
-  const params = new URLSearchParams();
-  const q = document.getElementById('searchInput').value.trim();
-  if (q) params.set('q', q);
-  if (activeCat) params.set('source', activeCat);
-  if (activeType) params.set('vuln_type', activeType);
-  if (activeSeverity) params.set('severity', activeSeverity);
-  if (activeDays) params.set('days', activeDays);
-  if (document.getElementById('pushedFilter').checked) params.set('pushed', '1');
-  params.set('limit', String(currentLimit));
-
-  const container = document.getElementById('cardList');
-  const moreRow = document.getElementById('loadMoreRow');
-  const moreBtn = document.getElementById('loadMoreBtn');
-  if (append) { moreBtn.disabled = true; moreBtn.textContent = 'Loading…'; }
-  try {
-    const vulns = await (await fetch('/api/vulns?' + params)).json();
-    if (!vulns.length) {
-      container.innerHTML = '<div class="empty"><p style="font-size:32px">&#128270;</p><p>No vulnerabilities found</p></div>';
-      moreRow.classList.add('hidden');
-      return;
-    }
-    moreRow.classList.toggle('hidden', vulns.length < currentLimit || currentLimit >= MAX_LIMIT);
-    moreBtn.disabled = false;
-    moreBtn.textContent = currentLimit >= MAX_LIMIT ? `Reached display cap (${MAX_LIMIT})` : 'Load more';
-    container.innerHTML = vulns.map((v,i) => {
-      const ss = SRC_STYLE[v.source] || {bg:'#F3F4F6',fg:'#374151'};
-      const ts = TYPE_STYLE[v.vuln_type] || {bg:'#F3F4F6',fg:'#6B7280'};
-      return `<div class="vcard" style="animation:fadeUp .4s ${i*.03}s both">
-        <div class="vcard-top">
-          <span class="src-badge" style="background:${ss.bg};color:${ss.fg}">${esc(v.source||'?')}</span>
-          <span class="reason-badge" style="background:${ts.bg};color:${ts.fg}">${esc(v.vuln_type||v.reason||'-')}</span>
-          ${sevBadge(v)}
-          <span class="pushed-dot ${v.pushed?'yes':'no'}" title="${v.pushed?(v.tg_sent?'Sent to Telegram':'Selected for push'):'Filtered'}"></span>
-          <span class="vcard-date">${esc(v.date||'-')}</span>
-        </div>
-        <div class="vcard-id">${esc(v.id||'N/A')}</div>
-        <div class="vcard-title">${esc(v.title)}</div>
-        ${v.summary?`<div class="vcard-summary">${esc(v.summary)}</div>`:''}
-        ${v.llm_verdict?`<div class="vcard-llm" title="${esc(v.llm_notes||'')}"><span class="llm-prefix">AI</span> ${esc(v.llm_verdict)}</div>`:''}
-        ${v.url?`<div class="vcard-link"><a href="${safeUrl(v.url)}" target="_blank" rel="noopener noreferrer">${esc(v.url)}</a></div>`:''}
-      </div>`;
-    }).join('');
-  } catch(e) {
-    container.innerHTML = '<div class="empty"><p>Failed to load</p></div>';
-    moreRow.classList.add('hidden');
-    moreBtn.disabled = false; moreBtn.textContent = 'Load more';
-  }
-}
-
-loadSources(); loadStats(); loadVulns();
-</script>
-<style>
-@keyframes fadeUp { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:translateY(0); } }
-::selection { background: var(--peach); color: var(--ink); }
-</style>
+    document.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => setView(btn.dataset.view)));
+    bootstrap();
+  </script>
 </body>
 </html>"""
 
-# substitute server-side constants into the template (single source of truth)
-DASHBOARD_HTML = DASHBOARD_HTML.replace("__LIMIT_MAX__", str(LIMIT_MAX))
-
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="vuln-monitor web dashboard")
-    p.add_argument("--port", type=int, default=8001)
-    p.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1 only)")
-    p.add_argument("--public", action="store_true",
-                   help="Bind 0.0.0.0 and require magic token for access")
-    p.add_argument("--token", default=None,
-                   help="Manually set token (overrides saved token)")
-    p.add_argument("--rotate-token", action="store_true",
-                   help="Generate a new token (invalidates old one)")
-    p.add_argument("--show-token", action="store_true",
-                   help="Print current token and exit")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="vuln-monitor shared dashboard")
+    parser.add_argument("--host", default=None, help="Override bind host")
+    parser.add_argument("--port", type=int, default=None, help="Override bind port")
+    args = parser.parse_args()
 
-    # Token management commands (work without --public)
-    if args.show_token:
-        if TOKEN_FILE.exists():
-            print(TOKEN_FILE.read_text(encoding="utf-8").strip())
-        else:
-            print("(no token file, run with --public to generate)")
-        raise SystemExit(0)
+    if not config_exists():
+        ensure_config_file()
+        print(f"NOTICE: created default config at {CONFIG_FILE}")
 
-    if args.rotate_token:
-        new_token = secrets.token_hex(8)
-        _save_token(new_token)
-        print(f"new token: {new_token}")
-        print(f"saved to:  {TOKEN_FILE}")
-        if not args.public:
-            print("restart vuln-web.service to apply")
-            raise SystemExit(0)
-
-    if args.token:
-        _save_token(args.token)
-        if not args.public:
-            print(f"token saved to {TOKEN_FILE}, restart vuln-web.service to apply")
-            raise SystemExit(0)
-
-    if not DB_FILE.exists():
-        print(f"ERROR: database not found at {DB_FILE}")
-        print("Run 'python src/vuln_monitor.py fetch' first to create it.")
-        raise SystemExit(1)
-
-    if args.public:
-        args.host = "0.0.0.0"
-        _MAGIC_TOKEN = args.token or (new_token if args.rotate_token else _load_or_create_token())
-        print(f"vuln-monitor dashboard (PUBLIC mode)")
-        print(f"  magic URL:  http://<your-ip>:{args.port}/{_MAGIC_TOKEN}/")
-        print(f"  token:      {_MAGIC_TOKEN}")
-        print(f"  token file: {TOKEN_FILE}")
-        print(f"  database:   {DB_FILE}")
-    else:
-        print(f"vuln-monitor dashboard: http://{args.host}:{args.port}")
-        print(f"database: {DB_FILE}")
-        if args.host == "127.0.0.1":
-            print(f"localhost only (use --public for external access, or SSH tunnel)")
-
-    serve(app, host=args.host, port=args.port)
+    cfg = current_config()
+    host = args.host or cfg["app"]["host"]
+    port = args.port or int(cfg["app"]["port"])
+    print(f"vuln-monitor dashboard: http://{host}:{port}")
+    print(f"config: {CONFIG_FILE}")
+    print(f"database: {db_file()}")
+    serve(app, host=host, port=port)
